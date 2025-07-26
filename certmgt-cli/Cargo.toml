@@ -1,0 +1,28 @@
+[package]
+name = "certmgt-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "CLI tool for certificate management using cert-lib"
+
+[[bin]]
+name = "certmgt-cli"
+path = "src/main.rs"
+
+[dependencies]
+# Your library
+certmgt-lib = { path = "../certmgt-lib" }
+
+# CLI and config dependencies
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+anyhow = "1.0"
+
+# For async operations (optional)
+tokio.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "2.1"
