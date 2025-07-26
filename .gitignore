@@ -1,0 +1,17 @@
+# Generated build artifacts
+/target/
+
+# Cargo.lock for libraries (binaries should include it)
+# If your project is a library, you might want to ignore Cargo.lock
+# Cargo.lock
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Other common ignored files
+*.log
+*.bak
+*.swp
