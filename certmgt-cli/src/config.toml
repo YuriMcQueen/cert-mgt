@@ -1,0 +1,3 @@
+compression = "Snappy"
+statistics = true
+row_group_size = 20
