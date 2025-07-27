@@ -1,7 +1,7 @@
-use base64::prelude::BASE64_STANDARD;
-use base64::Engine as _;
-use std::error::Error;
 use crate::types::CertDataType;
+use base64::Engine as _;
+use base64::prelude::BASE64_STANDARD;
+use std::error::Error;
 
 pub fn detect_cert_type(bytes: &[u8]) -> Result<CertDataType, Box<dyn Error>> {
     // Try interpreting as UTF-8 text (PEM is always text)

@@ -1,14 +1,19 @@
-// src/main.rs
+use certmgt_lib::filters::filter_certificates;
+use certmgt_lib::json::export_all_certificates;
 use certmgt_lib::{
-    CertificateConfig, save_certificates_to_json, load_certificates_from_json,
-    attach_private_key_to_certificate, list_all_certificate_names, AttachKeyError,
-    // Optional: compressed JSON functions
-    save_certificates_to_json_compressed, load_certificates_from_json_compressed
+    CertMgtError,
+    CertificateConfig,
+    attach_private_key_to_certificate,
+    list_all_certificate_names,
+    load_certificates_from_json,
+    load_certificates_from_json_compressed,
+    save_certificates_to_json,
+    save_certificates_to_json_compressed,
 };
-use certmgt_lib::json::{export_certificate, export_certificates_with_filter, export_all_certificates};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 use serde::de::Error;
+use std::path::PathBuf;
+use certmgt_lib::types::{CaConfig, ServerCertConfig};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -19,16 +24,47 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Generate {
+        #[arg(long, short = 'n', help = "Expiration in days", default_value = "365")]
+        validity_days: u32,
+        #[arg(long, short = 'c', help = "Country", default_value = "US")]
+        country: String,
+        #[arg(long, short = 's', help = "State", default_value = "IL")]
+        state: String,
+        #[arg(long, short = 'o', help = "Organization", default_value = "US")]
+        organization: String,
+        #[arg(long, help = "Common name", default_value = "example.com")]
+        common_name: String,
+        #[arg(long, help = "Certificate key size", default_value = "4096")]
+        key_size: u32,
+        #[arg(long, help = "Common name", default_value = "example.com")]
+        alt_names: Vec<String>,
+        #[arg(long, help = "CA key size", default_value = "4096")]
+        ca_key_size: u32,
+        #[arg(long, help = "CA expiration in days", default_value = "365")]
+        ca_validity_days: u32,
+    },
     /// Read certificates from a file (JSON, parquet, PEM, or P12) and display them
     Read {
         #[arg(long)]
         path: PathBuf,
         #[arg(long)]
         password: Option<String>,
-        #[arg(long, help = "Output format: summary, detailed, json, table", default_value = "summary")]
+        #[arg(
+            long,
+            help = "Output format: summary, detailed, json, table",
+            default_value = "summary"
+        )]
         format: String,
         #[arg(long, help = "Show certificate content (PEM data)")]
         show_content: bool,
+        #[arg(
+            long,
+            help = "Filter expressions (e.g., 'common_name~example', 'is_ca==true', 'not_after<=1672531200')"
+        )]
+        filters: Vec<String>,
+        #[arg(long, help = "Use OR logic between filters (default: AND)")]
+        or_logic: bool,
     },
     /// Import certificate files (PEM/P12) into a JSON database
     Import {
@@ -47,12 +83,48 @@ enum Commands {
         database: PathBuf,
         #[arg(long)]
         output_dir: PathBuf,
-        #[arg(long, help = "Filter by common name pattern")]
+        #[arg(
+            long,
+            help = "Advanced filter expressions (e.g., 'common_name~example')"
+        )]
+        filters: Vec<String>,
+        #[arg(long, help = "Use OR logic between filters (default: AND)")]
+        or_logic: bool,
+        #[arg(
+            long,
+            help = "[DEPRECATED] Filter by common name pattern - use --filters 'common_name~PATTERN' instead"
+        )]
         filter: Option<String>,
-        #[arg(long, help = "Filter by organization")]
+        #[arg(
+            long,
+            help = "[DEPRECATED] Filter by organization - use --filters 'organization~PATTERN' instead"
+        )]
         org_filter: Option<String>,
-        #[arg(long, help = "Export only CA certificates")]
+        #[arg(
+            long,
+            help = "[DEPRECATED] Export only CA certificates - use --filters 'is_ca==true' instead"
+        )]
         ca_only: bool,
+    },
+    /// Filter and display certificates from database using advanced filter expressions
+    // Filter {
+    //     #[arg(long, help = "Input database file (.json or .json.gz)")]
+    //     database: PathBuf,
+    //     #[arg(long, help = "Filter expressions (e.g., 'common_name~example', 'is_ca==true', 'not_after<=1672531200')")]
+    //     filters: Vec<String>,
+    //     #[arg(long, help = "Use OR logic between filters (default: AND)")]
+    //     or_logic: bool,
+    //     #[arg(long, help = "Output format: summary, detailed, json, table", default_value = "summary")]
+    //     format: String,
+    //     #[arg(long, help = "Show certificate content (PEM data)")]
+    //     show_content: bool,
+    // },
+    /// List certificates that match specific criteria (convenience commands)
+    List {
+        #[arg(long, help = "Input database file (.json or .json.gz)")]
+        database: PathBuf,
+        #[command(subcommand)]
+        list_type: ListType,
     },
     /// Attach a private key to an existing PEM certificate in the JSON database
     AttachKey {
@@ -67,10 +139,38 @@ enum Commands {
     },
     /// Convert between different database formats
     Convert {
-        #[arg(long, help = "Input file (supports .json, .json.gz, .parquet for legacy)")]
+        #[arg(
+            long,
+            help = "Input file (supports .json, .json.gz, .parquet for legacy)"
+        )]
         input: PathBuf,
         #[arg(long, help = "Output file (.json or .json.gz)")]
         output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ListType {
+    /// List certificates without private keys
+    WithoutKeys,
+    /// List CA certificates
+    CAs,
+    /// List certificates expiring within N days
+    Expiring {
+        #[arg(help = "Number of days ahead to check")]
+        days: i64,
+    },
+    /// List expired certificates
+    Expired,
+    /// List certificates by organization pattern
+    ByOrg {
+        #[arg(help = "Organization pattern to match")]
+        pattern: String,
+    },
+    /// List certificates by common name pattern
+    ByCN {
+        #[arg(help = "Common name pattern to match")]
+        pattern: String,
     },
 }
 
@@ -78,18 +178,40 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Commands::Read { path, password, format, show_content } => {
+        Commands::Read {
+            path,
+            password,
+            filters,
+            or_logic,
+            format,
+            show_content,
+        } => {
             let configs: Vec<CertificateConfig> = if is_database_file(&path) {
                 // Read from database file
-                load_certificates_from_database(&path)?
+                let filtered_configs = filter_certificates(&path, filters.clone(), or_logic)?;
+
+                let logic_type = if or_logic { "OR" } else { "AND" };
+                println!(
+                    "Filter results ({} logic): {} certificates found",
+                    logic_type,
+                    filtered_configs.len()
+                );
+                println!(
+                    "Applied filters: {}",
+                    filters.join(&format!(" {} ", logic_type))
+                );
+                filtered_configs
             } else {
                 // Read single certificate file - wrap in Vec for consistency
-                match CertificateConfig::read_from_path(path.to_str().unwrap(), password.as_deref()) {
+                match CertificateConfig::read_from_path(path.to_str().unwrap(), password.as_deref())
+                {
                     Ok(cfg) => vec![cfg],
                     Err(e) => {
                         // If it's a P12 file and no password was provided, prompt for one
                         if e.to_string().contains("mac verify failure") && password.is_none() {
-                            eprintln!("P12 file requires a password. Please provide it with --password");
+                            eprintln!(
+                                "P12 file requires a password. Please provide it with --password"
+                            );
                             std::process::exit(1);
                         }
                         eprintln!("Error reading certificate: {}", e);
@@ -106,13 +228,21 @@ fn main() -> anyhow::Result<()> {
                 "table" => display_table(&configs),
                 "content" => display_content_only(&configs),
                 _ => {
-                    eprintln!("Unsupported format: {}. Use: summary, detailed, json, table, content", format);
+                    eprintln!(
+                        "Unsupported format: {}. Use: summary, detailed, json, table, content",
+                        format
+                    );
                     std::process::exit(1);
                 }
             }
         }
 
-        Commands::Import { inputs, database, append, compressed } => {
+        Commands::Import {
+            inputs,
+            database,
+            append,
+            compressed,
+        } => {
             // Load new certificates from input files
             let mut new_configs = Vec::new();
             for p in &inputs {
@@ -127,7 +257,10 @@ fn main() -> anyhow::Result<()> {
                         io::stdout().flush().unwrap();
 
                         let password = rpassword::read_password()?;
-                        match CertificateConfig::read_from_path(p.to_str().unwrap(), Some(&password)) {
+                        match CertificateConfig::read_from_path(
+                            p.to_str().unwrap(),
+                            Some(&password),
+                        ) {
                             Ok(config) => config,
                             Err(e) => {
                                 eprintln!("Error reading {} with password: {}", p.display(), e);
@@ -174,9 +307,17 @@ fn main() -> anyhow::Result<()> {
 
             match result {
                 Ok(_) => {
-                    let format = if use_compression { "compressed JSON" } else { "JSON" };
-                    println!("Successfully saved {} certificates to {} ({})",
-                             final_configs.len(), database.display(), format);
+                    let format = if use_compression {
+                        "compressed JSON"
+                    } else {
+                        "JSON"
+                    };
+                    println!(
+                        "Successfully saved {} certificates to {} ({})",
+                        final_configs.len(),
+                        database.display(),
+                        format
+                    );
                 }
                 Err(e) => {
                     eprintln!("Error saving to database: {}", e);
@@ -185,69 +326,174 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Export { database, output_dir, filter, org_filter, ca_only } => {
-            // Load certificates from database file
-            let configs = match load_certificates_from_database(&database) {
-                Ok(configs) => configs,
-                Err(e) => {
-                    eprintln!("Error loading database: {}", e);
-                    std::process::exit(1);
-                }
-            };
+        Commands::Export {
+            database,
+            output_dir,
+            filters,
+            or_logic,
+            filter,
+            org_filter,
+            ca_only,
+        } => {
+            // Handle deprecated options by converting them to new filter format
+            let mut all_filters = filters;
 
-            println!("Loaded {} certificates from database", configs.len());
+            // Convert deprecated options to new filter format
+            if let Some(pattern) = filter {
+                eprintln!(
+                    "⚠️  WARNING: --filter is deprecated. Use --filters 'common_name~{}' instead",
+                    pattern
+                );
+                all_filters.push(format!("common_name~{}", pattern));
+            }
 
-            // Build filter function based on command line arguments
-            let filter_fn = |config: &CertificateConfig| -> bool {
-                // Apply CA filter
-                if ca_only && !config.is_ca {
-                    return false;
-                }
+            if let Some(org_pattern) = org_filter {
+                eprintln!(
+                    "⚠️  WARNING: --org-filter is deprecated. Use --filters 'organization~{}' instead",
+                    org_pattern
+                );
+                all_filters.push(format!("organization~{}", org_pattern));
+            }
 
-                // Apply common name filter
-                if let Some(ref pattern) = filter {
-                    if !config.common_name.contains(pattern) {
-                        return false;
-                    }
-                }
+            if ca_only {
+                eprintln!(
+                    "⚠️  WARNING: --ca-only is deprecated. Use --filters 'is_ca==true' instead"
+                );
+                all_filters.push("is_ca==true".to_string());
+            }
 
-                // Apply organization filter
-                if let Some(ref org_pattern) = org_filter {
-                    if !config.organization.contains(org_pattern) {
-                        return false;
-                    }
-                }
-
-                true
-            };
-
-            // Export certificates with filtering
-            let exported_files = if filter.is_some() || org_filter.is_some() || ca_only {
-                match export_certificates_with_filter(&configs, &output_dir, Some(filter_fn)) {
-                    Ok(files) => files,
+            let filtered_configs = if all_filters.is_empty() {
+                // Load all certificates if no filters
+                match load_certificates_from_database(&database) {
+                    Ok(configs) => configs,
                     Err(e) => {
-                        eprintln!("Error exporting certificates: {}", e);
+                        eprintln!("Error loading database: {}", e);
                         std::process::exit(1);
                     }
                 }
             } else {
-                // Export all certificates
-                match export_all_certificates(&configs, &output_dir) {
-                    Ok(files) => files,
+                // Apply advanced filtering
+                match filter_certificates(&database, all_filters, or_logic) {
+                    Ok(configs) => configs,
                     Err(e) => {
-                        eprintln!("Error exporting certificates: {}", e);
+                        eprintln!("Error filtering certificates: {}", e);
                         std::process::exit(1);
                     }
                 }
             };
 
-            println!("Successfully exported {} certificates to {}:", exported_files.len(), output_dir.display());
+            println!(
+                "Found {} certificates matching filters",
+                filtered_configs.len()
+            );
+
+            // Export the filtered certificates
+            let exported_files = match export_all_certificates(&filtered_configs, &output_dir) {
+                Ok(files) => files,
+                Err(e) => {
+                    eprintln!("Error exporting certificates: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            println!(
+                "Successfully exported {} certificates to {}:",
+                exported_files.len(),
+                output_dir.display()
+            );
             for file in &exported_files {
                 println!("  - {}", file);
             }
         }
+        Commands::List {
+            database,
+            list_type,
+        } => match list_type {
+            ListType::WithoutKeys => {
+                let configs = filter_certificates(
+                    &database,
+                    vec!["has_private_key==false".to_string()],
+                    false,
+                )?;
+                println!(
+                    "Certificates without private keys ({} found):",
+                    configs.len()
+                );
+                for config in configs {
+                    println!("  - {}", config.common_name);
+                }
+            }
 
-        Commands::AttachKey { database, common_name, key_path, key_password } => {
+            ListType::CAs => {
+                let configs =
+                    filter_certificates(&database, vec!["is_ca==true".to_string()], false)?;
+                println!("CA certificates ({} found):", configs.len());
+                for config in configs {
+                    println!("  - {} ({})", config.common_name, config.organization);
+                }
+            }
+
+            ListType::Expiring { days } => {
+                let threshold = chrono::Utc::now().timestamp() + (days * 24 * 60 * 60);
+                let filters = vec![
+                    format!("not_after<={}", threshold),
+                    format!("not_after>{}", chrono::Utc::now().timestamp()),
+                ];
+                let configs = filter_certificates(&database, filters, false)?;
+                println!(
+                    "Certificates expiring within {} days ({} found):",
+                    days,
+                    configs.len()
+                );
+                for config in configs {
+                    let days_left = (config.not_after - chrono::Utc::now().timestamp()) / 86400;
+                    println!("  - {} (expires in {} days)", config.common_name, days_left);
+                }
+            }
+
+            ListType::Expired => {
+                let filter = format!("not_after<{}", chrono::Utc::now().timestamp());
+                let configs = filter_certificates(&database, vec![filter], false)?;
+                println!("Expired certificates ({} found):", configs.len());
+                for config in configs {
+                    let days_ago = (chrono::Utc::now().timestamp() - config.not_after) / 86400;
+                    println!("  - {} (expired {} days ago)", config.common_name, days_ago);
+                }
+            }
+
+            ListType::ByOrg { pattern } => {
+                let filter = format!("organization~{}", pattern);
+                let configs = filter_certificates(&database, vec![filter], false)?;
+                println!(
+                    "Certificates with organization matching '{}' ({} found):",
+                    pattern,
+                    configs.len()
+                );
+                for config in configs {
+                    println!("  - {} ({})", config.common_name, config.organization);
+                }
+            }
+
+            ListType::ByCN { pattern } => {
+                let filter = format!("common_name~{}", pattern);
+                let configs = filter_certificates(&database, vec![filter], false)?;
+                println!(
+                    "Certificates with common name matching '{}' ({} found):",
+                    pattern,
+                    configs.len()
+                );
+                for config in configs {
+                    println!("  - {}", config.common_name);
+                }
+            }
+        },
+
+        Commands::AttachKey {
+            database,
+            common_name,
+            key_path,
+            key_password,
+        } => {
             // Check if certificate exists and get available certificates for better error messages
             let available_certs = match list_all_certificate_names(&database) {
                 Ok(certs) => certs,
@@ -293,7 +539,10 @@ fn main() -> anyhow::Result<()> {
             ) {
                 Ok(result) => {
                     // Success on first try
-                    println!("✅ Private key attached to certificate '{}'", result.certificate_common_name);
+                    println!(
+                        "✅ Private key attached to certificate '{}'",
+                        result.certificate_common_name
+                    );
                     if result.key_was_encrypted {
                         println!("   (Key was encrypted and successfully decrypted)");
                     }
@@ -302,9 +551,14 @@ fn main() -> anyhow::Result<()> {
                     }
                     return Ok(());
                 }
-                Err(AttachKeyError::InvalidPrivateKey(msg)) if msg.contains("already has a private key") => {
+                Err(CertMgtError::InvalidPrivateKey(msg))
+                    if msg.contains("already has a private key") =>
+                {
                     // Key already exists, ask for confirmation
-                    eprintln!("Certificate '{}' already has a private key attached.", common_name);
+                    eprintln!(
+                        "Certificate '{}' already has a private key attached.",
+                        common_name
+                    );
                     eprint!("Do you want to replace it? (y/N): ");
                     use std::io::{self, Write};
                     io::stdout().flush().unwrap();
@@ -315,8 +569,10 @@ fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     eprintln!("❌ Error attaching private key: {}", e);
-                    if let AttachKeyError::InvalidPrivateKey(_) = e {
-                        eprintln!("💡 Make sure the key file is in PEM format and the password is correct.");
+                    if let CertMgtError::InvalidPrivateKey(_) = e {
+                        eprintln!(
+                            "💡 Make sure the key file is in PEM format and the password is correct."
+                        );
                     }
                     std::process::exit(1);
                 }
@@ -332,7 +588,10 @@ fn main() -> anyhow::Result<()> {
                     true,
                 ) {
                     Ok(result) => {
-                        println!("✅ Private key attached to certificate '{}'", result.certificate_common_name);
+                        println!(
+                            "✅ Private key attached to certificate '{}'",
+                            result.certificate_common_name
+                        );
                         if result.key_was_encrypted {
                             println!("   (Key was encrypted and successfully decrypted)");
                         }
@@ -365,14 +624,45 @@ fn main() -> anyhow::Result<()> {
 
             match result {
                 Ok(_) => {
-                    let format = if use_compression { "compressed JSON" } else { "JSON" };
-                    println!("✅ Successfully converted to {} ({})", output.display(), format);
+                    let format = if use_compression {
+                        "compressed JSON"
+                    } else {
+                        "JSON"
+                    };
+                    println!(
+                        "✅ Successfully converted to {} ({})",
+                        output.display(),
+                        format
+                    );
                 }
                 Err(e) => {
                     eprintln!("❌ Error converting: {}", e);
                     std::process::exit(1);
                 }
             }
+        },
+        Commands::Generate { validity_days, country, state, organization, common_name, key_size, alt_names, ca_validity_days,ca_key_size } => {
+            let new_ca_config = CaConfig {
+                country,
+                state,
+                organization,
+                common_name,
+                key_size: ca_key_size,
+                validity_days: ca_validity_days,
+            };
+
+
+            let new_cert_config = ServerCertConfig {
+                country,
+                state,
+                organization,
+                common_name,
+                alt_names,
+                key_size,
+                validity_days,
+            };
+            let a = CertificateConfig::generate_ca(new_ca_config)?;
+            CertificateConfig::generate_server_cert(new_cert_config)
         }
     }
     Ok(())
@@ -387,7 +677,8 @@ fn is_database_file(path: &PathBuf) -> bool {
             // Check if it's .json.gz
             path.file_stem()
                 .and_then(|stem| std::path::Path::new(stem).extension())
-                .and_then(|ext| ext.to_str()) == Some("json")
+                .and_then(|ext| ext.to_str())
+                == Some("json")
         }
         Some("parquet") => true, // Legacy support
         _ => false,
@@ -398,21 +689,22 @@ fn is_compressed_file(path: &PathBuf) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("gz")
 }
 
-fn load_certificates_from_database(path: &PathBuf) -> Result<Vec<CertificateConfig>, AttachKeyError> {
+fn load_certificates_from_database(path: &PathBuf) -> Result<Vec<CertificateConfig>, CertMgtError> {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("json") => load_certificates_from_json(path),
         Some("gz") => {
             // Assume .json.gz
-            load_certificates_from_json_compressed(path).map_err(|e| {
-                AttachKeyError::JsonError(serde_json::Error::custom(e.to_string()))
-            })
+            load_certificates_from_json_compressed(path)
+                .map_err(|e| CertMgtError::JsonError(serde_json::Error::custom(e.to_string())))
         }
         Some("parquet") => {
             // Legacy support - you'd need to keep one parquet function or convert
             eprintln!("Legacy parquet format detected. Please convert to JSON first:");
-            eprintln!("  certmgt-cli convert --input {} --output {}",
-                      path.display(),
-                      path.with_extension("json").display());
+            eprintln!(
+                "  certmgt-cli convert --input {} --output {}",
+                path.display(),
+                path.with_extension("json").display()
+            );
             std::process::exit(1);
         }
         _ => {
@@ -428,10 +720,18 @@ fn display_summary(configs: &[CertificateConfig], show_content: bool) {
     for (idx, config) in configs.iter().enumerate() {
         let cert_type = match &config.cert_data {
             certmgt_lib::CertData::Pem { key, .. } => {
-                if key.is_some() { "PEM+Key" } else { "PEM" }
+                if key.is_some() {
+                    "PEM+Key"
+                } else {
+                    "PEM"
+                }
             }
             certmgt_lib::CertData::P12 { as_base64, .. } => {
-                if *as_base64 { "P12(B64)" } else { "P12" }
+                if *as_base64 {
+                    "P12(B64)"
+                } else {
+                    "P12"
+                }
             }
         };
 
@@ -444,13 +744,14 @@ fn display_summary(configs: &[CertificateConfig], show_content: bool) {
             "VALID"
         };
 
-        println!("{:3}: {} | {} | {} | {} days | {}",
-                 idx + 1,
-                 config.common_name.chars().take(30).collect::<String>(),
-                 cert_type,
-                 status,
-                 expires_in_days,
-                 if config.is_ca { "CA" } else { "CERT" }
+        println!(
+            "{:3}: {} | {} | {} | {} days | {}",
+            idx + 1,
+            config.common_name.chars().take(30).collect::<String>(),
+            cert_type,
+            status,
+            expires_in_days,
+            if config.is_ca { "CA" } else { "CERT" }
         );
 
         if show_content {
@@ -494,7 +795,10 @@ fn display_detailed(configs: &[CertificateConfig], show_content: bool) {
         if expires_in_days < 0 {
             println!("  Status: ⚠️  EXPIRED ({} days ago)", -expires_in_days);
         } else if expires_in_days < 30 {
-            println!("  Status: ⚠️  EXPIRING SOON ({} days remaining)", expires_in_days);
+            println!(
+                "  Status: ⚠️  EXPIRING SOON ({} days remaining)",
+                expires_in_days
+            );
         } else {
             println!("  Status: ✅ VALID ({} days remaining)", expires_in_days);
         }
@@ -510,9 +814,14 @@ fn display_detailed(configs: &[CertificateConfig], show_content: bool) {
                     println!("  Private Key: Not included");
                 }
             }
-            certmgt_lib::CertData::P12 { data, as_base64, .. } => {
+            certmgt_lib::CertData::P12 {
+                data, as_base64, ..
+            } => {
                 println!("  Format: PKCS#12");
-                println!("  Encoding: {}", if *as_base64 { "Base64" } else { "Binary" });
+                println!(
+                    "  Encoding: {}",
+                    if *as_base64 { "Base64" } else { "Binary" }
+                );
                 println!("  Data Length: {} bytes", data.len());
                 println!("  Contains: Certificate + Private Key");
             }
@@ -528,37 +837,41 @@ fn display_json(configs: &[CertificateConfig], show_content: bool) -> anyhow::Re
     use serde_json;
 
     // Create a simplified structure for JSON output
-    let json_configs: Vec<serde_json::Value> = configs.iter().map(|config| {
-        let cert_type_info = match &config.cert_data {
-            certmgt_lib::CertData::Pem { key, cert } => {
-                let mut info = serde_json::json!({
+    let json_configs: Vec<serde_json::Value> = configs
+        .iter()
+        .map(|config| {
+            let cert_type_info = match &config.cert_data {
+                certmgt_lib::CertData::Pem { key, cert } => {
+                    let mut info = serde_json::json!({
                     "format": "PEM",
                     "has_private_key": key.is_some()
-                });
+                    });
 
-                if show_content {
-                    info["certificate_pem"] = serde_json::Value::String(cert.clone());
-                    if let Some(key_data) = key {
-                        info["private_key_pem"] = serde_json::Value::String(key_data.clone());
+                    if show_content {
+                        info["certificate_pem"] = serde_json::Value::String(cert.clone());
+                        if let Some(key_data) = key {
+                            info["private_key_pem"] = serde_json::Value::String(key_data.clone());
+                        }
                     }
+                    info
                 }
-                info
-            }
-            certmgt_lib::CertData::P12 { as_base64, data, .. } => {
-                let mut info = serde_json::json!({
+                certmgt_lib::CertData::P12 {
+                    as_base64, data, ..
+                } => {
+                    let mut info = serde_json::json!({
                     "format": "PKCS12",
                     "encoding": if *as_base64 { "base64" } else { "binary" },
                     "has_private_key": true
-                });
+                    });
 
-                if show_content {
-                    info["p12_data"] = serde_json::Value::String(data.clone());
+                    if show_content {
+                        info["p12_data"] = serde_json::Value::String(data.clone());
+                    }
+                    info
                 }
-                info
-            }
-        };
+            };
 
-        serde_json::json!({
+            serde_json::json!({
             "common_name": config.common_name,
             "organization": config.organization,
             "organizational_unit": config.organizational_unit,
@@ -571,8 +884,9 @@ fn display_json(configs: &[CertificateConfig], show_content: bool) -> anyhow::Re
             "not_after": config.not_after,
             "has_private_key": config.has_private_key(),
             "certificate_type": cert_type_info
+            })
         })
-    }).collect();
+        .collect();
 
     println!("{}", serde_json::to_string_pretty(&json_configs)?);
     Ok(())
@@ -595,31 +909,47 @@ fn display_table(configs: &[CertificateConfig]) {
     max_org = cmp::min(max_org, 25);
 
     // Print header
-    println!("{:<3} | {:<width_cn$} | {:<width_org$} | {:<8} | {:<10} | {:<6} | {:<4}",
-             "#", "Common Name", "Organization", "Type", "Expires", "Status", "CA",
-             width_cn = max_cn, width_org = max_org);
+    println!(
+        "{:<3} | {:<width_cn$} | {:<width_org$} | {:<8} | {:<10} | {:<6} | {:<4}",
+        "#",
+        "Common Name",
+        "Organization",
+        "Type",
+        "Expires",
+        "Status",
+        "CA",
+        width_cn = max_cn,
+        width_org = max_org
+    );
 
-    println!("{}", "-".repeat(3 + 3 + max_cn + 3 + max_org + 3 + 8 + 3 + 10 + 3 + 6 + 3 + 4));
+    println!(
+        "{}",
+        "-".repeat(3 + 3 + max_cn + 3 + max_org + 3 + 8 + 3 + 10 + 3 + 6 + 3 + 4)
+    );
 
     // Print rows
     for (idx, config) in configs.iter().enumerate() {
         let cn = if config.common_name.len() > max_cn {
-            format!("{}...", &config.common_name[..max_cn-3])
+            format!("{}...", &config.common_name[..max_cn - 3])
         } else {
             config.common_name.clone()
         };
 
         let org = if config.organization.len() > max_org {
-            format!("{}...", &config.organization[..max_org-3])
+            format!("{}...", &config.organization[..max_org - 3])
         } else {
             config.organization.clone()
         };
 
         let cert_type = match &config.cert_data {
             certmgt_lib::CertData::Pem { key, .. } => {
-                if key.is_some() { "PEM+Key" } else { "PEM" }
+                if key.is_some() {
+                    "PEM+Key"
+                } else {
+                    "PEM"
+                }
             }
-            certmgt_lib::CertData::P12 { .. } => "P12"
+            certmgt_lib::CertData::P12 { .. } => "P12",
         };
 
         let expires_in_days = (config.not_after - chrono::Utc::now().timestamp()) / 86400;
@@ -637,10 +967,18 @@ fn display_table(configs: &[CertificateConfig]) {
             "VALID"
         };
 
-        println!("{:<3} | {:<width_cn$} | {:<width_org$} | {:<8} | {:<10} | {:<6} | {:<4}",
-                 idx + 1, cn, org, cert_type, expires_str, status,
-                 if config.is_ca { "YES" } else { "NO" },
-                 width_cn = max_cn, width_org = max_org);
+        println!(
+            "{:<3} | {:<width_cn$} | {:<width_org$} | {:<8} | {:<10} | {:<6} | {:<4}",
+            idx + 1,
+            cn,
+            org,
+            cert_type,
+            expires_str,
+            status,
+            if config.is_ca { "YES" } else { "NO" },
+            width_cn = max_cn,
+            width_org = max_org
+        );
     }
 }
 
@@ -661,11 +999,21 @@ fn display_certificate_content(config: &CertificateConfig, index: usize) {
                 println!("\n🔑 Private Key: Not included");
             }
         }
-        certmgt_lib::CertData::P12 { data, as_base64, .. } => {
-            println!("📦 PKCS#12 Data ({}):", if *as_base64 { "Base64" } else { "Binary as Base64" });
+        certmgt_lib::CertData::P12 {
+            data, as_base64, ..
+        } => {
+            println!(
+                "📦 PKCS#12 Data ({}):",
+                if *as_base64 {
+                    "Base64"
+                } else {
+                    "Binary as Base64"
+                }
+            );
 
             // Display P12 data with line breaks for readability
-            let chunks: Vec<&str> = data.as_bytes()
+            let chunks: Vec<&str> = data
+                .as_bytes()
                 .chunks(64)
                 .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
                 .collect();
@@ -676,7 +1024,9 @@ fn display_certificate_content(config: &CertificateConfig, index: usize) {
                 }
             }
 
-            println!("\n💡 Note: This is the complete PKCS#12 bundle containing both certificate and private key.");
+            println!(
+                "\n💡 Note: This is the complete PKCS#12 bundle containing both certificate and private key."
+            );
         }
     }
     println!();

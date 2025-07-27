@@ -1,7 +1,7 @@
+use crate::errors::CertMgtError;
+use crate::types::{CertData, CertificateConfig};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use crate::types::{CertificateConfig, CertData};
-use thiserror::Error;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CertificateDatabase {
@@ -29,23 +29,29 @@ impl CertificateDatabase {
 }
 
 // JSON storage functions (replacing your parquet functions)
-pub fn save_certificates_to_json(configs: Vec<CertificateConfig>, path: &Path) -> Result<(), AttachKeyError> {
+pub fn save_certificates_to_json(
+    configs: Vec<CertificateConfig>,
+    path: &Path,
+) -> Result<(), CertMgtError> {
     let db = CertificateDatabase::with_certificates(configs);
     let json = serde_json::to_string_pretty(&db)?;
     std::fs::write(path, json)?;
     Ok(())
 }
 
-pub fn load_certificates_from_json(path: &Path) -> Result<Vec<CertificateConfig>, AttachKeyError> {
+pub fn load_certificates_from_json(path: &Path) -> Result<Vec<CertificateConfig>, CertMgtError> {
     let content = std::fs::read_to_string(path)?;
     let db: CertificateDatabase = serde_json::from_str(&content)?;
     Ok(db.certificates)
 }
 
 // Compressed JSON variant (if you need smaller files)
-pub fn save_certificates_to_json_compressed(configs: Vec<CertificateConfig>, path: &Path) -> Result<(), AttachKeyError> {
-    use std::io::Write;
+pub fn save_certificates_to_json_compressed(
+    configs: Vec<CertificateConfig>,
+    path: &Path,
+) -> Result<(), CertMgtError> {
     use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
 
     let db = CertificateDatabase::with_certificates(configs);
     let json = serde_json::to_string(&db)?; // No pretty printing for compression
@@ -57,9 +63,11 @@ pub fn save_certificates_to_json_compressed(configs: Vec<CertificateConfig>, pat
     Ok(())
 }
 
-pub fn load_certificates_from_json_compressed(path: &Path) -> Result<Vec<CertificateConfig>, AttachKeyError> {
-    use std::io::Read;
+pub fn load_certificates_from_json_compressed(
+    path: &Path,
+) -> Result<Vec<CertificateConfig>, CertMgtError> {
     use flate2::read::GzDecoder;
+    use std::io::Read;
 
     let file = std::fs::File::open(path)?;
     let mut decoder = GzDecoder::new(file);
@@ -71,7 +79,10 @@ pub fn load_certificates_from_json_compressed(path: &Path) -> Result<Vec<Certifi
 }
 
 // JSONL (JSON Lines) variant for streaming/appending
-pub fn save_certificates_to_jsonl(configs: Vec<CertificateConfig>, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn save_certificates_to_jsonl(
+    configs: Vec<CertificateConfig>,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
     let mut file = std::fs::File::create(path)?;
@@ -82,7 +93,9 @@ pub fn save_certificates_to_jsonl(configs: Vec<CertificateConfig>, path: &Path) 
     Ok(())
 }
 
-pub fn load_certificates_from_jsonl(path: &Path) -> Result<Vec<CertificateConfig>, Box<dyn std::error::Error>> {
+pub fn load_certificates_from_jsonl(
+    path: &Path,
+) -> Result<Vec<CertificateConfig>, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
     let mut configs = Vec::new();
 
@@ -98,14 +111,14 @@ pub fn load_certificates_from_jsonl(path: &Path) -> Result<Vec<CertificateConfig
 }
 
 // Append a single certificate to JSONL file
-pub fn append_certificate_to_jsonl(config: CertificateConfig, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn append_certificate_to_jsonl(
+    config: CertificateConfig,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     let line = serde_json::to_string(&config)?;
     writeln!(file, "{}", line)?;
@@ -115,10 +128,10 @@ pub fn append_certificate_to_jsonl(config: CertificateConfig, path: &Path) -> Re
 /// Export certificate in its original format with optional filtering
 pub fn export_certificate(
     config: &CertificateConfig,
-    output_path: &Path
+    output_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use base64::prelude::BASE64_STANDARD;
     use base64::Engine as _;
+    use base64::prelude::BASE64_STANDARD;
 
     match &config.cert_data {
         CertData::Pem { cert, key } => {
@@ -133,7 +146,11 @@ pub fn export_certificate(
             std::fs::write(output_path, pem_content)?;
         }
 
-        CertData::P12 { data, password: _, as_base64 } => {
+        CertData::P12 {
+            data,
+            password: _,
+            as_base64,
+        } => {
             // Export as P12 file in original format
             if *as_base64 {
                 // Data was originally base64, decode it to binary for P12 file
@@ -155,7 +172,7 @@ pub fn export_certificate(
 pub fn export_certificates_with_filter<F>(
     configs: &[CertificateConfig],
     output_dir: &Path,
-    filter: Option<F>
+    filter: Option<F>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>>
 where
     F: Fn(&CertificateConfig) -> bool,
@@ -185,9 +202,16 @@ where
             format!("cert_{}.{}", index, extension)
         } else {
             // Sanitize common name for filename
-            let sanitized_name = config.common_name
+            let sanitized_name = config
+                .common_name
                 .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect::<String>();
             format!("{}_{}.{}", sanitized_name, index, extension)
         };
@@ -203,33 +227,10 @@ where
 /// Export all certificates without filtering
 pub fn export_all_certificates(
     configs: &[CertificateConfig],
-    output_dir: &Path
+    output_dir: &Path,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     export_certificates_with_filter(configs, output_dir, None::<fn(&CertificateConfig) -> bool>)
 }
-
-
-#[derive(Debug, Error)]
-pub enum AttachKeyError {
-    #[error("Certificate with common name '{0}' not found")]
-    CertificateNotFound(String),
-
-    #[error("Cannot attach key to P12 certificate")]
-    NotPemCertificate,
-
-    #[error("Invalid private key: {0}")]
-    InvalidPrivateKey(String),
-
-    #[error("IO error")]
-    IoError(#[from] std::io::Error),  // Auto-generates From impl
-
-    #[error("JSON error")]
-    JsonError(#[from] serde_json::Error),  // Auto-generates From impl
-
-    #[error("OpenSSL error")]
-    OpensslError(#[from] openssl::error::ErrorStack),  // Auto-generates From impl
-}
-
 
 pub struct AttachKeyResult {
     pub certificate_common_name: String,
@@ -244,7 +245,7 @@ pub fn attach_private_key_to_certificate(
     key_path: &Path,
     key_password: Option<&str>,
     force_replace: bool,
-) -> Result<AttachKeyResult, AttachKeyError> {
+) -> Result<AttachKeyResult, CertMgtError> {
     use openssl::pkey::PKey;
 
     // Load existing certificates
@@ -253,20 +254,22 @@ pub fn attach_private_key_to_certificate(
         _ => load_certificates_from_json(json_path)?,
     };
     // Find the certificate to update
-    let cert_index = configs.iter().position(|config| {
-        config.common_name == common_name
-    }).ok_or_else(|| AttachKeyError::CertificateNotFound(common_name.to_string()))?;
+    let cert_index = configs
+        .iter()
+        .position(|config| config.common_name == common_name)
+        .ok_or_else(|| CertMgtError::CertificateNotFound(common_name.to_string()))?;
 
     // Check if it's a PEM certificate and if it already has a key
     let config = &mut configs[cert_index];
     let had_existing_key = match &config.cert_data {
         CertData::P12 { .. } => {
-            return Err(AttachKeyError::NotPemCertificate);
+            return Err(CertMgtError::NotPemCertificate);
         }
         CertData::Pem { key: Some(_), .. } => {
             if !force_replace {
-                return Err(AttachKeyError::InvalidPrivateKey(
-                    "Certificate already has a private key. Use force_replace=true to override.".to_string()
+                return Err(CertMgtError::InvalidPrivateKey(
+                    "Certificate already has a private key. Use force_replace=true to override."
+                        .to_string(),
                 ));
             }
             true
@@ -280,13 +283,10 @@ pub fn attach_private_key_to_certificate(
     // Validate that it's a valid private key
     let key_was_encrypted = key_password.is_some();
     let _key_validation = if let Some(password) = key_password {
-        PKey::private_key_from_pem_passphrase(
-            key_content.as_bytes(),
-            password.as_bytes()
-        )?
+        PKey::private_key_from_pem_passphrase(key_content.as_bytes(), password.as_bytes())?
     } else {
         PKey::private_key_from_pem(key_content.as_bytes())
-            .map_err(|e| AttachKeyError::InvalidPrivateKey(e.to_string()))?
+            .map_err(|e| CertMgtError::InvalidPrivateKey(e.to_string()))?
     };
 
     // Update the certificate with the new key
@@ -298,7 +298,6 @@ pub fn attach_private_key_to_certificate(
     match json_path.extension().and_then(|ext| ext.to_str()) {
         Some("gz") => save_certificates_to_json_compressed(configs, json_path)?,
         _ => save_certificates_to_json(configs, json_path)?,
-
     };
 
     Ok(AttachKeyResult {
@@ -309,16 +308,14 @@ pub fn attach_private_key_to_certificate(
 }
 
 /// List all certificates in a JSON database that don't have private keys
-pub fn list_certificates_without_keys(json_path: &Path) -> Result<Vec<String>, AttachKeyError> {
+pub fn list_certificates_without_keys(json_path: &Path) -> Result<Vec<String>, CertMgtError> {
     let configs = load_certificates_from_json(json_path)?;
 
     let certs_without_keys: Vec<String> = configs
         .iter()
-        .filter_map(|config| {
-            match &config.cert_data {
-                CertData::Pem { key: None, .. } => Some(config.common_name.clone()),
-                _ => None,
-            }
+        .filter_map(|config| match &config.cert_data {
+            CertData::Pem { key: None, .. } => Some(config.common_name.clone()),
+            _ => None,
         })
         .collect();
 
@@ -327,7 +324,7 @@ pub fn list_certificates_without_keys(json_path: &Path) -> Result<Vec<String>, A
 
 /// Get all certificate common names from a JSON database
 
-pub fn list_all_certificate_names(json_path: &Path) -> Result<Vec<String>, AttachKeyError> {
+pub fn list_all_certificate_names(json_path: &Path) -> Result<Vec<String>, CertMgtError> {
     // Match on the Option<Option<&str>> returned by extension()
     let configs = match json_path.extension().and_then(|ext| ext.to_str()) {
         Some("gz") => load_certificates_from_json_compressed(json_path)?,
@@ -335,45 +332,49 @@ pub fn list_all_certificate_names(json_path: &Path) -> Result<Vec<String>, Attac
     };
 
     // Return the common_name values
-    Ok(configs.into_iter().map(|config| config.common_name).collect())
+    Ok(configs
+        .into_iter()
+        .map(|config| config.common_name)
+        .collect())
 }
 
 // Helper functions for querying certificates (basic filtering without SQL-like operations)
 pub fn find_certificates_by_common_name(
     json_path: &Path,
-    common_name: &str
-) -> Result<Vec<CertificateConfig>, AttachKeyError> {
+    common_name: &str,
+) -> Result<Vec<CertificateConfig>, CertMgtError> {
     let configs = load_certificates_from_json(json_path)?;
-    Ok(configs.into_iter()
+    Ok(configs
+        .into_iter()
         .filter(|config| config.common_name.contains(common_name))
         .collect())
 }
 
 pub fn find_certificates_by_organization(
     json_path: &Path,
-    organization: &str
-) -> Result<Vec<CertificateConfig>, AttachKeyError> {
+    organization: &str,
+) -> Result<Vec<CertificateConfig>, CertMgtError> {
     let configs = load_certificates_from_json(json_path)?;
-    Ok(configs.into_iter()
+    Ok(configs
+        .into_iter()
         .filter(|config| config.organization.contains(organization))
         .collect())
 }
 
 pub fn find_expiring_certificates(
     json_path: &Path,
-    days_ahead: i64
-) -> Result<Vec<CertificateConfig>, AttachKeyError> {
+    days_ahead: i64,
+) -> Result<Vec<CertificateConfig>, CertMgtError> {
     let configs = load_certificates_from_json(json_path)?;
     let threshold = chrono::Utc::now().timestamp() + (days_ahead * 24 * 60 * 60);
 
-    Ok(configs.into_iter()
+    Ok(configs
+        .into_iter()
         .filter(|config| config.not_after <= threshold && config.not_after > 0)
         .collect())
 }
 
-pub fn find_ca_certificates(json_path: &Path) -> Result<Vec<CertificateConfig>, AttachKeyError> {
+pub fn find_ca_certificates(json_path: &Path) -> Result<Vec<CertificateConfig>, CertMgtError> {
     let configs = load_certificates_from_json(json_path)?;
-    Ok(configs.into_iter()
-        .filter(|config| config.is_ca)
-        .collect())
+    Ok(configs.into_iter().filter(|config| config.is_ca).collect())
 }
