@@ -1,6 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificateConfig {
     pub country: String,
     pub state: String,
@@ -12,15 +12,13 @@ pub struct CertificateConfig {
     pub not_after: i64,
     pub not_before: i64,
     pub key_size: Option<u32>,
-    pub cert_type: CertType,
-    pub cert_pem: Option<String>,
-    pub key_pem: Option<String>,
+    pub cert_data: CertData,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub enum CertType {
-    Pem,
-    P12 { password: String, as_base64: bool },
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CertData {
+    Pem { cert: String, key: Option<String> },
+    P12 { data: String, password: String, as_base64: bool },
 }
 
 #[derive(Debug)]

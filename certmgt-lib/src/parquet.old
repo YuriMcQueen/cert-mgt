@@ -1,0 +1,470 @@
+use polars::prelude::*;
+use std::path::Path;
+use crate::types::{CertificateConfig, CertData};
+
+#[derive(Default)]
+pub struct ParquetExportOptions {
+    pub compression: ParquetCompression,
+    pub statistics: bool,
+    pub row_group_size: Option<usize>,
+}
+
+impl ParquetExportOptions {
+    pub fn new() -> Self {
+        Self {
+            compression: ParquetCompression::Snappy,
+            statistics: true,
+            row_group_size: None,
+        }
+    }
+
+    pub fn with_compression(mut self, compression: ParquetCompression) -> Self {
+        self.compression = compression;
+        self
+    }
+}
+
+#[derive(Default)]
+pub enum ParquetCompressionConfig {
+    #[default]
+    Snappy,
+    Gzip,
+    Lz4,
+    Brotli,
+    Zstd,
+}
+
+// Free functions for better separation of concerns
+pub fn save_certificates_to_parquet(configs: Vec<CertificateConfig>, path: &Path) -> PolarsResult<()> {
+    let mut df = certificates_to_dataframe(configs)?;
+
+    let file = std::fs::File::create(path).map_err(PolarsError::from)?;
+
+    ParquetWriter::new(file)
+        .with_compression(ParquetCompression::Snappy)
+        .finish(&mut df)?;
+
+    Ok(())
+}
+
+pub fn save_certificates_to_parquet_with_options(
+    configs: Vec<CertificateConfig>,
+    path: impl AsRef<Path>,
+    compression: ParquetCompression,
+    statistics: bool,
+) -> PolarsResult<()> {
+    let mut df = certificates_to_dataframe(configs)?;
+
+    let file = std::fs::File::create(path).map_err(PolarsError::from)?;
+    let mut writer = ParquetWriter::new(file).with_compression(compression);
+
+    if statistics {
+        writer = writer.with_statistics(StatisticsOptions::default());
+    }
+
+    writer.finish(&mut df)?;
+    Ok(())
+}
+
+pub fn load_certificates_from_parquet(path: &Path) -> PolarsResult<Vec<CertificateConfig>> {
+    // Step 1: scan the Parquet file lazily
+    let lf = LazyFrame::scan_parquet(path, ScanArgsParquet::default())?;
+
+    // Step 2: collect into an eager DataFrame
+    let df = lf
+        .select([
+            col("common_name"),
+            col("country"),
+            col("state"),
+            col("locality"),
+            col("organization"),
+            col("organizational_unit"),
+            col("is_ca"),
+            col("not_before"),
+            col("not_after"),
+            col("key_size"),
+            col("cert_data_type"),
+            col("cert_pem"),
+            col("key_pem"),
+            col("p12_data"),
+            col("p12_password"),
+            col("p12_as_base64"),
+        ])
+        .collect()?;
+
+    // Step 3: extract columns
+    let cn = df.column("common_name")?.str()?;
+    let co = df.column("country")?.str()?;
+    let st = df.column("state")?.str()?;
+    let lo = df.column("locality")?.str()?;
+    let or = df.column("organization")?.str()?;
+    let ou = df.column("organizational_unit")?.str()?;
+    let ca = df.column("is_ca")?.bool()?;
+    let nb = df.column("not_before")?.i64()?;
+    let na = df.column("not_after")?.i64()?;
+    let ks = df.column("key_size")?.u32()?;
+    let cdt = df.column("cert_data_type")?.str()?;
+    let cp = df.column("cert_pem")?.str()?;
+    let kp = df.column("key_pem")?.str()?;
+    let pd = df.column("p12_data")?.str()?;
+    let pp = df.column("p12_password")?.str()?;
+    let pb = df.column("p12_as_base64")?.bool()?;
+
+    let mut configs = Vec::with_capacity(df.height());
+
+    for idx in 0..df.height() {
+        let cert_data = match cdt.get(idx).unwrap_or("PEM") {
+            "PEM" => {
+                let cert = cp.get(idx).unwrap_or("").to_string();
+                let key = kp.get(idx)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+
+                CertData::Pem { cert, key }
+            }
+            "P12" => {
+                let data = pd.get(idx).unwrap_or("").to_string();
+                let password = pp.get(idx).unwrap_or("").to_string();
+                let as_base64 = pb.get(idx).unwrap_or(false);
+
+                CertData::P12 { data, password, as_base64 }
+            }
+            _ => {
+                // Default to PEM with empty cert if unknown type
+                CertData::Pem {
+                    cert: cp.get(idx).unwrap_or("").to_string(),
+                    key: None
+                }
+            }
+        };
+
+        configs.push(CertificateConfig {
+            country: co.get(idx).unwrap_or("").to_string(),
+            state: st.get(idx).unwrap_or("").to_string(),
+            locality: lo.get(idx).unwrap_or("").to_string(),
+            organization: or.get(idx).unwrap_or("").to_string(),
+            organizational_unit: ou.get(idx).unwrap_or("").to_string(),
+            common_name: cn.get(idx).unwrap_or("").to_string(),
+            is_ca: ca.get(idx).unwrap_or(false),
+            not_before: nb.get(idx).unwrap_or(0),
+            not_after: na.get(idx).unwrap_or(0),
+            key_size: ks.get(idx),
+            cert_data,
+        });
+    }
+
+    Ok(configs)
+}
+
+/// Load certificates from Parquet file (basic DataFrame only)
+pub fn load_dataframe_from_parquet(path: &Path) -> PolarsResult<DataFrame> {
+    LazyFrame::scan_parquet(path, ScanArgsParquet::default())?.collect()
+}
+
+/// Export certificate in its original format with optional filtering
+pub fn export_certificate(
+    config: &CertificateConfig,
+    output_path: &Path
+) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::prelude::BASE64_STANDARD;
+    use base64::Engine as _;
+
+    match &config.cert_data {
+        CertData::Pem { cert, key } => {
+            // Export as PEM file - combine cert and key if both exist
+            let mut pem_content = cert.clone();
+            if let Some(key_data) = key {
+                if !key_data.is_empty() {
+                    pem_content.push('\n');
+                    pem_content.push_str(key_data);
+                }
+            }
+            std::fs::write(output_path, pem_content)?;
+        }
+
+        CertData::P12 { data, password: _, as_base64 } => {
+            // Export as P12 file in original format
+            if *as_base64 {
+                // Data was originally base64, decode it to binary for P12 file
+                let filtered: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+                let p12_bytes = BASE64_STANDARD.decode(&filtered)?;
+                std::fs::write(output_path, p12_bytes)?;
+            } else {
+                // Data is stored as base64 but was originally binary
+                let p12_bytes = BASE64_STANDARD.decode(data)?;
+                std::fs::write(output_path, p12_bytes)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Export certificates with optional filtering
+pub fn export_certificates_with_filter<F>(
+    configs: &[CertificateConfig],
+    output_dir: &Path,
+    filter: Option<F>
+) -> Result<Vec<String>, Box<dyn std::error::Error>>
+where
+    F: Fn(&CertificateConfig) -> bool,
+{
+    use std::fs;
+
+    // Create output directory if it doesn't exist
+    fs::create_dir_all(output_dir)?;
+
+    let mut exported_files = Vec::new();
+
+    for (index, config) in configs.iter().enumerate() {
+        // Apply filter if provided
+        if let Some(ref filter_fn) = filter {
+            if !filter_fn(config) {
+                continue;
+            }
+        }
+
+        // Generate filename based on common name and certificate type
+        let extension = match &config.cert_data {
+            CertData::Pem { .. } => "pem",
+            CertData::P12 { .. } => "p12",
+        };
+
+        let filename = if config.common_name.is_empty() {
+            format!("cert_{}.{}", index, extension)
+        } else {
+            // Sanitize common name for filename
+            let sanitized_name = config.common_name
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect::<String>();
+            format!("{}_{}.{}", sanitized_name, index, extension)
+        };
+
+        let output_path = output_dir.join(&filename);
+        export_certificate(config, &output_path)?;
+        exported_files.push(filename);
+    }
+
+    Ok(exported_files)
+}
+
+/// Export all certificates without filtering
+pub fn export_all_certificates(
+    configs: &[CertificateConfig],
+    output_dir: &Path
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    export_certificates_with_filter(configs, output_dir, None::<fn(&CertificateConfig) -> bool>)
+}
+
+fn certificates_to_dataframe(configs: Vec<CertificateConfig>) -> PolarsResult<DataFrame> {
+    let mut common_names = Vec::new();
+    let mut countries = Vec::new();
+    let mut states = Vec::new();
+    let mut localities = Vec::new();
+    let mut organizations = Vec::new();
+    let mut organizational_units = Vec::new();
+    let mut is_cas = Vec::new();
+    let mut not_afters = Vec::new();
+    let mut not_befores = Vec::new();
+    let mut key_sizes = Vec::new();
+    let mut cert_data_types = Vec::new();
+    let mut cert_pems = Vec::new();
+    let mut key_pems = Vec::new();
+    let mut p12_datas = Vec::new();
+    let mut p12_passwords = Vec::new();
+    let mut p12_as_base64s = Vec::new();
+
+    for config in configs {
+        common_names.push(config.common_name);
+        countries.push(config.country);
+        states.push(config.state);
+        localities.push(config.locality);
+        organizations.push(config.organization);
+        organizational_units.push(config.organizational_unit);
+        is_cas.push(config.is_ca);
+        not_afters.push(config.not_after as i64);
+        not_befores.push(config.not_before as i64);
+        key_sizes.push(config.key_size);
+
+        // Handle the cert_data enum
+        match config.cert_data {
+            CertData::Pem { cert, key } => {
+                cert_data_types.push("PEM".to_string());
+                cert_pems.push(cert);
+                key_pems.push(key.unwrap_or_default());
+                p12_datas.push(String::new());
+                p12_passwords.push(String::new());
+                p12_as_base64s.push(false);
+            }
+            CertData::P12 { data, password, as_base64 } => {
+                cert_data_types.push("P12".to_string());
+                cert_pems.push(String::new());
+                key_pems.push(String::new());
+                p12_datas.push(data);
+                p12_passwords.push(password);
+                p12_as_base64s.push(as_base64);
+            }
+        }
+    }
+
+    DataFrame::new(vec![
+        Series::new(PlSmallStr::from("common_name"), common_names).into_column(),
+        Series::new(PlSmallStr::from("country"), countries).into_column(),
+        Series::new(PlSmallStr::from("state"), states).into_column(),
+        Series::new(PlSmallStr::from("locality"), localities).into_column(),
+        Series::new(PlSmallStr::from("organization"), organizations).into_column(),
+        Series::new(
+            PlSmallStr::from("organizational_unit"),
+            organizational_units,
+        ).into_column(),
+        Series::new(PlSmallStr::from("is_ca"), is_cas).into_column(),
+        Series::new(PlSmallStr::from("not_after"), not_afters).into_column(),
+        Series::new(PlSmallStr::from("not_before"), not_befores).into_column(),
+        Series::new(PlSmallStr::from("key_size"), key_sizes).into_column(),
+        Series::new(PlSmallStr::from("cert_data_type"), cert_data_types).into_column(),
+        Series::new(PlSmallStr::from("cert_pem"), cert_pems).into_column(),
+        Series::new(PlSmallStr::from("key_pem"), key_pems).into_column(),
+        Series::new(PlSmallStr::from("p12_data"), p12_datas).into_column(),
+        Series::new(PlSmallStr::from("p12_password"), p12_passwords).into_column(),
+        Series::new(PlSmallStr::from("p12_as_base64"), p12_as_base64s).into_column(),
+    ])
+}
+
+#[derive(Debug)]
+pub enum AttachKeyError {
+    CertificateNotFound(String),
+    NotPemCertificate,
+    InvalidPrivateKey(String),
+    IoError(std::io::Error),
+    ParquetError(polars::error::PolarsError),
+    OpensslError(openssl::error::ErrorStack),
+}
+
+impl std::fmt::Display for AttachKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttachKeyError::CertificateNotFound(cn) => write!(f, "Certificate with common name '{}' not found", cn),
+            AttachKeyError::NotPemCertificate => write!(f, "Cannot attach key to P12 certificate. P12 certificates already contain private keys."),
+            AttachKeyError::InvalidPrivateKey(msg) => write!(f, "Invalid private key: {}", msg),
+            AttachKeyError::IoError(e) => write!(f, "IO error: {}", e),
+            AttachKeyError::ParquetError(e) => write!(f, "Parquet error: {}", e),
+            AttachKeyError::OpensslError(e) => write!(f, "OpenSSL error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for AttachKeyError {}
+
+impl From<std::io::Error> for AttachKeyError {
+    fn from(error: std::io::Error) -> Self {
+        AttachKeyError::IoError(error)
+    }
+}
+
+impl From<polars::error::PolarsError> for AttachKeyError {
+    fn from(error: polars::error::PolarsError) -> Self {
+        AttachKeyError::ParquetError(error)
+    }
+}
+
+impl From<openssl::error::ErrorStack> for AttachKeyError {
+    fn from(error: openssl::error::ErrorStack) -> Self {
+        AttachKeyError::OpensslError(error)
+    }
+}
+
+pub struct AttachKeyResult {
+    pub certificate_common_name: String,
+    pub had_existing_key: bool,
+    pub key_was_encrypted: bool,
+}
+
+/// Attach a private key to an existing PEM certificate in a Parquet database
+pub fn attach_private_key_to_certificate(
+    parquet_path: &Path,
+    common_name: &str,
+    key_path: &Path,
+    key_password: Option<&str>,
+    force_replace: bool,
+) -> Result<AttachKeyResult, AttachKeyError> {
+    use openssl::pkey::PKey;
+
+    // Load existing certificates
+    let mut configs = load_certificates_from_parquet(parquet_path)?;
+
+    // Find the certificate to update
+    let cert_index = configs.iter().position(|config| {
+        config.common_name == common_name
+    }).ok_or_else(|| AttachKeyError::CertificateNotFound(common_name.to_string()))?;
+
+    // Check if it's a PEM certificate and if it already has a key
+    let config = &mut configs[cert_index];
+    let had_existing_key = match &config.cert_data {
+        CertData::P12 { .. } => {
+            return Err(AttachKeyError::NotPemCertificate);
+        }
+        CertData::Pem { key: Some(_), .. } => {
+            if !force_replace {
+                // Could return a specific error type for "key already exists"
+                return Err(AttachKeyError::InvalidPrivateKey(
+                    "Certificate already has a private key. Use force_replace=true to override.".to_string()
+                ));
+            }
+            true
+        }
+        CertData::Pem { key: None, .. } => false,
+    };
+
+    // Read the private key file
+    let key_content = std::fs::read_to_string(key_path)?;
+
+    // Validate that it's a valid private key
+    let key_was_encrypted = key_password.is_some();
+    let _key_validation = if let Some(password) = key_password {
+        PKey::private_key_from_pem_passphrase(
+            key_content.as_bytes(),
+            password.as_bytes()
+        )?
+    } else {
+        PKey::private_key_from_pem(key_content.as_bytes())
+            .map_err(|e| AttachKeyError::InvalidPrivateKey(e.to_string()))?
+    };
+
+    // Update the certificate with the new key
+    if let CertData::Pem { key, .. } = &mut configs[cert_index].cert_data {
+        *key = Some(key_content);
+    }
+
+    // Save back to parquet
+    save_certificates_to_parquet(configs, parquet_path)?;
+
+    Ok(AttachKeyResult {
+        certificate_common_name: common_name.to_string(),
+        had_existing_key,
+        key_was_encrypted,
+    })
+}
+
+/// List all certificates in a Parquet database that don't have private keys
+pub fn list_certificates_without_keys(parquet_path: &Path) -> Result<Vec<String>, AttachKeyError> {
+    let configs = load_certificates_from_parquet(parquet_path)?;
+
+    let certs_without_keys: Vec<String> = configs
+        .iter()
+        .filter_map(|config| {
+            match &config.cert_data {
+                CertData::Pem { key: None, .. } => Some(config.common_name.clone()),
+                _ => None,
+            }
+        })
+        .collect();
+
+    Ok(certs_without_keys)
+}
+
+/// Get all certificate common names from a Parquet database
+pub fn list_all_certificate_names(parquet_path: &Path) -> Result<Vec<String>, AttachKeyError> {
+    let configs = load_certificates_from_parquet(parquet_path)?;
+    Ok(configs.into_iter().map(|config| config.common_name).collect())
+}

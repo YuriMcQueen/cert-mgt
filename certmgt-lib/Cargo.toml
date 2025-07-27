@@ -8,11 +8,12 @@ description = "A library for managing X.509 certificates"
 
 [dependencies]
 openssl.workspace = true
-polars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 base64.workspace = true
+flate2 = "1.1.2"
+thiserror = "2.0.12"
 
 [dev-dependencies]
 tempfile = "3.0"
