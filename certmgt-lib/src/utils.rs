@@ -15,7 +15,7 @@ pub fn asn1_time_to_timestamp(asn1_time: &Asn1TimeRef) -> i64 {
     let ts = time_str.replace(" GMT", "").replace(" UTC", "");
 
     if let Ok(dt) = NaiveDateTime::parse_from_str(&ts, "%b %e %H:%M:%S %Y") {
-        return dt.timestamp();
+        return dt.and_utc().timestamp();
     }
 
     // fallback diff code swapped...

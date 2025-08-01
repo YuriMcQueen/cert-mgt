@@ -1,20 +1,23 @@
-use base64::Engine as _;
+use crate::detection::detect_cert_type;
+use crate::types::{CaConfig, CertData, CertDataType, CertificateConfig, ServerCertConfig};
+use crate::utils::{asn1_time_to_timestamp, parse_cert_field};
+use crate::CertMgtError;
 use base64::prelude::BASE64_STANDARD;
-use openssl::nid::Nid;
-use openssl::pkcs12::Pkcs12;
-use openssl::pkey::{PKey, Private};
-use openssl::x509::{X509NameBuilder, X509Ref, X509Req, X509ReqBuilder, X509VerifyResult, X509};
-use std::error::Error;
+use base64::Engine as _;
 use openssl::asn1::Asn1Time;
 use openssl::bn::{BigNum, MsbOption};
 use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
+use openssl::nid::Nid;
+use openssl::pkcs12::Pkcs12;
+use openssl::pkey::{PKey, Private};
 use openssl::rsa::Rsa;
 use openssl::x509::extension::{AuthorityKeyIdentifier, BasicConstraints, KeyUsage, SubjectAlternativeName, SubjectKeyIdentifier};
-use crate::detection::detect_cert_type;
-use crate::types::{CaConfig, CertData, CertDataType, CertificateConfig, ServerCertConfig};
-use crate::utils::{asn1_time_to_timestamp, parse_cert_field};
-
+use openssl::x509::{X509NameBuilder, X509Ref, X509Req, X509ReqBuilder, X509VerifyResult, X509};
+use std::error::Error;
+use x509_parser::asn1_rs::FromDer;
+use x509_parser::certificate::X509Certificate;
+use x509_parser::extensions::BasicConstraints as ParserBasicConstraints;
 impl CertificateConfig {
     pub fn read_from_path(path: &str, password: Option<&str>) -> Result<Self, Box<dyn Error>> {
         let bytes = std::fs::read(path)?;
@@ -98,12 +101,7 @@ impl CertificateConfig {
             parse_cert_field(subject_name, Nid::ORGANIZATIONALUNITNAME).unwrap_or_default();
 
         // Check if this is a CA certificate
-        let is_ca = subject_name
-            .entries_by_nid(openssl::nid::Nid::BASIC_CONSTRAINTS)
-            .into_iter()
-            .map(|entry| entry.data().as_slice())
-            .any(|data| data.windows(5).any(|w| w == b"CA:TRUE"));
-
+        let is_ca = is_ca(&cert).unwrap_or_else(|_| false);
         let common_name = parse_cert_field(subject_name, Nid::COMMONNAME).unwrap_or_default();
         let not_after = asn1_time_to_timestamp(cert.not_after());
         let not_before = asn1_time_to_timestamp(cert.not_before());
@@ -123,7 +121,7 @@ impl CertificateConfig {
             cert_data,
         }
     }
-    pub fn generate_ca(config: CaConfig) -> Result<Self, Box<dyn Error>> {
+    pub fn generate_ca(config: CaConfig) -> Result<Self, CertMgtError> {
         let (cert, key_pair) = Self::mk_ca_cert(&config)?;
 
         // Convert to PEM format
@@ -142,16 +140,24 @@ impl CertificateConfig {
     pub fn generate_server_cert(
         config: ServerCertConfig,
         ca_cert: &CertificateConfig,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self, CertMgtError> {
         // Extract CA certificate and key
         let ca_x509 = match &ca_cert.cert_data {
             CertData::Pem { cert, .. } => X509::from_pem(cert.as_bytes())?,
-            CertData::P12 { .. } => return Err("P12 CA certificates not supported for signing".into()),
+            CertData::P12 { .. } => {
+                return Err(CertMgtError::InvalidConfiguration(
+                    "P12 CA certificates not supported for signing".to_string()
+                ))
+            }
         };
 
         let ca_key = match &ca_cert.cert_data {
             CertData::Pem { key: Some(key), .. } => PKey::private_key_from_pem(key.as_bytes())?,
-            _ => return Err("CA certificate must have a private key".into()),
+            _ => {
+                return Err(CertMgtError::InvalidConfiguration(
+                    "CA certificate must have a private key".to_string()
+                ))
+            }
         };
 
         let (cert, key_pair) = Self::mk_ca_signed_cert(&config, &ca_x509, &ca_key)?;
@@ -173,7 +179,7 @@ impl CertificateConfig {
         &self,
         ca_cert: &CertificateConfig,
         new_validity_days: u32,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self, CertMgtError> {
         let config = ServerCertConfig {
             country: self.country.clone(),
             state: self.state.clone(),
@@ -345,10 +351,6 @@ impl CertificateConfig {
         let req = req_builder.build();
         Ok(req)
     }
-}
-
-// Helper methods for accessing certificate data
-impl CertificateConfig {
     /// Get the certificate as PEM string
     pub fn get_cert_pem(&self) -> Option<&str> {
         match &self.cert_data {
@@ -372,4 +374,14 @@ impl CertificateConfig {
             CertData::P12 { .. } => true, // P12 always contains both cert and key
         }
     }
+}
+
+fn is_ca(cert: &X509) -> Result<bool, Box<dyn std::error::Error>> {
+    let der = cert.to_der()?; // Convert OpenSSL X509 into DER bytes
+    let (_, parsed) = X509Certificate::from_der(&der)?;
+    let extensions = parsed.extensions();
+    for ext in extensions {
+        println!("{:?}", ext);
+    }
+    Ok(is_ca)
 }

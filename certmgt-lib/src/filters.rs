@@ -167,6 +167,13 @@ impl FilterLogic {
             Ok(FilterLogic::And(expressions))
         }
     }
+    pub fn matches(&self, config: &CertificateConfig) -> bool {
+        match self {
+            FilterLogic::Single(expr) => expr.matches(config),
+            FilterLogic::And(expressions) => expressions.iter().all(|expr| expr.matches(config)),
+            FilterLogic::Or(expressions) => expressions.iter().any(|expr| expr.matches(config)),
+        }
+    }
 }
 
 // Filter application logic
@@ -230,17 +237,6 @@ impl FilterExpression {
         }
     }
 }
-
-impl FilterLogic {
-    pub fn matches(&self, config: &CertificateConfig) -> bool {
-        match self {
-            FilterLogic::Single(expr) => expr.matches(config),
-            FilterLogic::And(expressions) => expressions.iter().all(|expr| expr.matches(config)),
-            FilterLogic::Or(expressions) => expressions.iter().any(|expr| expr.matches(config)),
-        }
-    }
-}
-
 // Main generic filter function
 pub fn filter_certificates(
     json_path: &Path,
