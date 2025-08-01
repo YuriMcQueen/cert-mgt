@@ -15,9 +15,12 @@ use openssl::rsa::Rsa;
 use openssl::x509::extension::{AuthorityKeyIdentifier, BasicConstraints, KeyUsage, SubjectAlternativeName, SubjectKeyIdentifier};
 use openssl::x509::{X509NameBuilder, X509Ref, X509Req, X509ReqBuilder, X509VerifyResult, X509};
 use std::error::Error;
-use x509_parser::asn1_rs::FromDer;
+use x509_parser::asn1_rs::{FromDer, Oid};
 use x509_parser::certificate::X509Certificate;
-use x509_parser::extensions::BasicConstraints as ParserBasicConstraints;
+use x509_parser::extensions::ParsedExtension;
+use x509_parser::oid_registry;
+use x509_parser::public_key::PublicKey;
+
 impl CertificateConfig {
     pub fn read_from_path(path: &str, password: Option<&str>) -> Result<Self, Box<dyn Error>> {
         let bytes = std::fs::read(path)?;
@@ -101,25 +104,28 @@ impl CertificateConfig {
             parse_cert_field(subject_name, Nid::ORGANIZATIONALUNITNAME).unwrap_or_default();
 
         // Check if this is a CA certificate
-        let is_ca = is_ca(&cert).unwrap_or_else(|_| false);
-        let common_name = parse_cert_field(subject_name, Nid::COMMONNAME).unwrap_or_default();
-        let not_after = asn1_time_to_timestamp(cert.not_after());
-        let not_before = asn1_time_to_timestamp(cert.not_before());
-        let key_size = key.as_ref().map(|k| k.bits());
-
-        CertificateConfig {
-            country,
-            state,
-            locality,
-            organization,
-            organizational_unit,
-            common_name,
-            is_ca,
-            not_after,
-            not_before,
-            key_size,
-            cert_data,
-        }
+        // let is_ca = is_ca(&cert).unwrap_or_else(|_| false);
+        // let common_name = parse_cert_field(subject_name, Nid::COMMONNAME).unwrap_or_default();
+        // let not_after = asn1_time_to_timestamp(cert.not_after());
+        // let not_before = asn1_time_to_timestamp(cert.not_before());
+        // let key_size = key.as_ref().map(|k| k.bits());
+        let cert = get_cert_info(&cert, cert_data).unwrap();
+        println!("{:?}", cert);
+        cert
+        // CertificateConfig {
+        //     country,
+        //     state,
+        //     locality,
+        //     organization,
+        //     organizational_unit,
+        //     common_name,
+        //     is_ca,
+        //     not_after,
+        //     not_before,
+        //     key_size,
+        //     cert_data,
+        //     serial_number,
+        // }
     }
     pub fn generate_ca(config: CaConfig) -> Result<Self, CertMgtError> {
         let (cert, key_pair) = Self::mk_ca_cert(&config)?;
@@ -281,7 +287,7 @@ impl CertificateConfig {
         ca_cert: &X509Ref,
         ca_key_pair: &PKey<Private>,
     ) -> Result<(X509, PKey<Private>), ErrorStack> {
-        let rsa = Rsa::generate(config.key_size)?;
+        let rsa = Rsa::generate(config.key_size as u32)?;
         let key_pair = PKey::from_rsa(rsa)?;
         let req = Self::mk_request(config, &key_pair)?;
 
@@ -376,12 +382,65 @@ impl CertificateConfig {
     }
 }
 
-fn is_ca(cert: &X509) -> Result<bool, Box<dyn std::error::Error>> {
-    let der = cert.to_der()?; // Convert OpenSSL X509 into DER bytes
+
+fn get_subject_attr(parsed: &X509Certificate, oid: Oid) -> String {
+    parsed.subject().iter_by_oid(&oid)
+        .next()
+        .and_then(|attr| attr.as_str().ok())
+        .map(|s| s.to_owned())
+        .unwrap_or_default()
+
+}
+
+fn get_key_size(cert: &X509Certificate) -> Option<usize> {
+    cert.subject_pki
+        .parsed()
+        .map(|pk| match pk {
+            PublicKey::RSA(rsa) => rsa.key_size(),       // RSA: bits in modulus
+            PublicKey::EC(ec)   => ec.key_size(),        // EC: curve size
+            PublicKey::DSA(buf) => 8 * buf.len(),        // DSA: parameter length
+            _ => 0,
+        })
+        .ok()
+        .filter(|&bits| bits > 0)
+}
+fn get_cert_info(cert: &X509, cert_data: CertData) -> Result<CertificateConfig, Box<dyn std::error::Error>> {
+    let der = cert.to_der()?;
     let (_, parsed) = X509Certificate::from_der(&der)?;
-    let extensions = parsed.extensions();
-    for ext in extensions {
-        println!("{:?}", ext);
-    }
-    Ok(is_ca)
+    let serial_number = parsed.serial.to_string();
+    let is_ca = parsed.is_ca();
+    let not_after = asn1_time_to_timestamp(&parsed.validity.not_after);
+    let not_before = asn1_time_to_timestamp(&parsed.validity.not_before);
+    let country = get_subject_attr(&parsed, oid_registry::OID_X509_COUNTRY_NAME);
+    let state = get_subject_attr(&parsed, oid_registry::OID_X509_STATE_OR_PROVINCE_NAME);
+    let locality = get_subject_attr(&parsed, oid_registry::OID_X509_LOCALITY_NAME);
+    let organization = get_subject_attr(&parsed, oid_registry::OID_X509_ORGANIZATION_NAME);
+    let organizational_unit = get_subject_attr(&parsed, oid_registry::OID_X509_ORGANIZATIONAL_UNIT);
+    let common_name = get_subject_attr(&parsed, oid_registry::OID_X509_COMMON_NAME);
+    let key_size = get_key_size(&parsed);
+    // let is_ca = parsed
+    //     .extensions()
+    //     .iter()
+    //     .map(|ext| ext.parsed_extension())
+    //     .find_map(|pe| match pe {
+    //         ParsedExtension::BasicConstraints(bc) => Some(bc.ca),
+    //         _ => None,
+    //     })
+    //     .unwrap_or(false);
+    let cert = CertificateConfig {
+        country,
+        state,
+        locality,
+        organization,
+        organizational_unit,
+        common_name,
+        is_ca,
+        not_after,
+        not_before,
+        key_size,
+        cert_data,
+        serial_number,
+    };
+
+    Ok(cert)
 }

@@ -1,3 +1,4 @@
+use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,8 +12,9 @@ pub struct CertificateConfig {
     pub is_ca: bool,
     pub not_after: i64,
     pub not_before: i64,
-    pub key_size: Option<u32>,
+    pub key_size: Option<usize>,
     pub cert_data: CertData,
+    pub serial_number: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +28,28 @@ pub enum CertData {
         password: String,
         as_base64: bool,
     },
+}
+
+impl fmt::Display for CertData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CertData::Pem { cert, key } => {
+                writeln!(f, "PEM Certificate:")?;
+                writeln!(f, "{}", cert.replace("\\n", "\n"))?;
+                if let Some(k) = key {
+                    writeln!(f, "\nPEM Private Key:")?;
+                    writeln!(f, "{}", k.replace("\\n", "\n"))?;
+                }
+                Ok(())
+            }
+            CertData::P12 { data, password, as_base64 } => {
+                writeln!(f, "PKCS#12 certificate (as_base64={}):", as_base64)?;
+                writeln!(f, "{}", data.replace("\\n", "\n"))?;
+                writeln!(f, "Password: {}", password)?;
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -67,7 +91,7 @@ pub struct ServerCertConfig {
     pub organization: String,
     pub common_name: String,
     pub alt_names: Vec<String>,
-    pub key_size: u32,
+    pub key_size: usize,
     pub validity_days: u32,
 }
 

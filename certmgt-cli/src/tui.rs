@@ -650,6 +650,10 @@ fn draw_certificate_list<B: Backend>(f: &mut Frame, app: &mut App) {
                     Style::default().fg(Color::White)
                 ),
                 Span::styled(
+                    format!("{:<30} ", cert.serial_number.chars().take(30).collect::<String>()),
+                    Style::default().fg(Color::White)
+                ),
+                Span::styled(
                     format!("{:<8} ", cert_type),
                     Style::default().fg(Color::Blue)
                 ),
@@ -727,7 +731,15 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
     } else {
         format!("✅ VALID ({} days)", expires_in_days)
     };
+    let cert_info: (&str, &str, Option<&str>)= match &cert.cert_data {
+        certmgt_lib::CertData::Pem { key, cert } => {
 
+            if key.is_some() { ("PEM with Private Key", cert, key.as_deref()) } else { ("PEM Certificate Only",cert, None) }
+        },
+        certmgt_lib::CertData::P12 { as_base64,data , .. } => {
+            if *as_base64 { ("PKCS#12 (Base64)", data, None) } else { ("PKCS#12 (Binary)", data, None) }
+        }
+    };
     let detail_text = format!(
         "Common Name: {}\n\
          Organization: {}\n\
@@ -743,27 +755,22 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
          \n\
          Valid From: {}\n\
          Valid Until: {}\n\
-         Status: {}\n",
+         Status: {}\n\
+         Cert Data: {}\n",
         cert.common_name,
         cert.organization,
         cert.organizational_unit,
         cert.country,
         cert.state,
         cert.locality,
-        match &cert.cert_data {
-            certmgt_lib::CertData::Pem { key, .. } => {
-                if key.is_some() { "PEM with Private Key" } else { "PEM Certificate Only" }
-            },
-            certmgt_lib::CertData::P12 { as_base64, .. } => {
-                if *as_base64 { "PKCS#12 (Base64)" } else { "PKCS#12 (Binary)" }
-            }
-        },
+        cert_info.0,
         cert.is_ca,
         cert.key_size,
         cert.has_private_key(),
         not_before,
         not_after,
-        status
+        status,
+        cert_info.1
     );
 
     let detail_paragraph = Paragraph::new(detail_text)

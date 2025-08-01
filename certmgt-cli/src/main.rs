@@ -506,11 +506,11 @@ fn main() -> anyhow::Result<()> {
                 organization,
                 common_name,
                 alt_names,
-                key_size,
+                key_size: key_size as usize,
                 validity_days,
             };
             let ca = CertificateConfig::generate_ca(new_ca_config)?;
-            println!("{:?}", ca);
+            println!("{:?}", ca.cert_data);
             let cert = CertificateConfig::generate_server_cert(new_cert_config, &ca)?;
             save_certificates_to_json(vec![ca, cert], &database)?;
 

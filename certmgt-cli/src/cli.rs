@@ -18,7 +18,7 @@ pub enum Commands {
         country: String,
         #[arg(long, short = 's', help = "State", default_value = "IL")]
         state: String,
-        #[arg(long, short = 'o', help = "Organization", default_value = "US")]
+        #[arg(long, short = 'o', help = "Organization", default_value = "Example Inc")]
         organization: String,
         #[arg(long, help = "Common name", default_value = "example.com")]
         common_name: String,
