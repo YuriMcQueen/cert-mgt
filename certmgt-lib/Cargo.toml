@@ -15,6 +15,9 @@ base64.workspace = true
 flate2.workspace= true
 thiserror.workspace = true
 x509-parser.workspace = true
-
+rcgen.workspace = true
+time = "0.3"
+p12 = "0.6"
+pem = "3.0.5"
 [dev-dependencies]
 tempfile = "3.0"

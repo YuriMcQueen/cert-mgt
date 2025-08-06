@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+// Your existing error type
 #[derive(Debug, Error)]
 pub enum CertMgtError {
     #[error("Certificate with common name '{0}' not found")]

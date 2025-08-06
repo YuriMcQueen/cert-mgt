@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fmt;
+use rcgen::Certificate;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +17,13 @@ pub struct CertificateConfig {
     pub key_size: Option<usize>,
     pub cert_data: CertData,
     pub serial_number: String,
+}
+
+pub struct CertificateAuthority {
+    pub(crate) ca_cert: Certificate,
+    pub(crate) ca_config: CaConfig,
+    pub(crate) serial_counter: u64,
+    pub(crate) issued_certificates: HashMap<String, CertificateConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
