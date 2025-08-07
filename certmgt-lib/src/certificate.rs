@@ -8,14 +8,14 @@ use base64::Engine as _;
 
 use std::error::Error;
 use std::time::{SystemTime, UNIX_EPOCH};
+use p12::PFX;
+use pem::{parse, parse_many};
 use time::OffsetDateTime;
 use x509_parser::asn1_rs::{FromDer, Oid};
 use x509_parser::certificate::X509Certificate;
-use x509_parser::extensions::ParsedExtension;
 use x509_parser::oid_registry;
 use x509_parser::public_key::PublicKey;
-
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, BasicConstraints, IsCa, SanType, KeyUsagePurposePurpose};
+use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, BasicConstraints, IsCa, SanType};
 
 impl CertificateConfig {
     pub fn read_from_path(path: &str, password: Option<&str>) -> Result<Self, Box<dyn Error>> {
@@ -44,17 +44,13 @@ impl CertificateConfig {
 
         let mut cert_pem: Option<String> = None;
         let mut key_pem: Option<String> = None;
-        let mut parsed_cert: Option<X509Certificate<'static>> = None;
+        let mut cert_der_bytes: Option<Vec<u8>> = None;
 
         for pem in pems {
             match pem.tag() {
                 "CERTIFICATE" => {
-                    // Parse the certificate with x509_parser
-                    let (_, cert) = X509Certificate::from_der(pem.contents())?;
-                    // Convert to owned data to extend lifetime
-                    let owned_cert = cert.to_owned();
-                    parsed_cert = Some(owned_cert);
-
+                    // Store the DER bytes
+                    cert_der_bytes = Some(pem.contents().to_vec());
                     // Reconstruct PEM format
                     cert_pem = Some(pem::encode(&pem));
                 }
@@ -68,28 +64,21 @@ impl CertificateConfig {
         }
 
         let cert_pem = cert_pem.ok_or("No certificate found in PEM")?;
-        let parsed_cert = parsed_cert.ok_or("Failed to parse certificate")?;
+        let der_bytes = cert_der_bytes.ok_or("No certificate DER data found")?;
 
-        // Extract certificate information
-        let common_name = extract_common_name(&parsed_cert)?;
-        let (not_before, not_after) = extract_validity(&parsed_cert)?;
-        let is_ca = is_ca_certificate(&parsed_cert);
+        // Parse the certificate here where der_bytes is still in scope
+        let (_, parsed_cert) = X509Certificate::from_der(&der_bytes)?;
 
         let cert_data = CertData::Pem {
             cert: cert_pem,
             key: key_pem,
         };
 
-        Ok(CertificateConfig {
-            cert_data,
-            parsed_cert: Some(parsed_cert),
-            common_name,
-            not_before,
-            not_after,
-            is_ca,
-        })
-    }
+        // Extract certificate info immediately while parsed_cert is valid
+        let cert = get_cert_info(parsed_cert, cert_data)?;
 
+        Ok(cert)
+    }
     fn parse_pem_cert_only(content: &str) -> Result<Self, Box<dyn Error>> {
         let pem = parse(content)?;
 
@@ -100,363 +89,65 @@ impl CertificateConfig {
         // Parse the certificate with x509_parser
         let (_, cert) = X509Certificate::from_der(pem.contents())?;
         let owned_cert = cert.to_owned();
-
-        // Extract certificate information
-        let common_name = extract_common_name(&owned_cert)?;
-        let (not_before, not_after) = extract_validity(&owned_cert)?;
-        let is_ca = is_ca_certificate(&owned_cert);
-
         let cert_pem = pem::encode(&pem);
         let cert_data = CertData::Pem {
             cert: cert_pem,
             key: None,
         };
 
-        Ok(CertificateConfig {
-            cert_data,
-            parsed_cert: Some(owned_cert),
-            common_name,
-            not_before,
-            not_after,
-            is_ca,
-        })
+        let cert = get_cert_info(cert, cert_data)?;
+
+        Ok(cert)
     }
-
-    fn parse_p12(bytes: &[u8], password: Option<&str>, as_base64: bool) -> Result<Self, Box<dyn Error>> {
-        // For P12, we still need to use the p12 crate as x509_parser doesn't handle P12
-        use p12::PFX;
-
+    pub fn parse_p12(
+        bytes: &[u8],
+        password: Option<&str>,
+        as_base64: bool,
+    ) -> Result<Self, Box<dyn Error>> {
+        // Decode base64 if necessary
         let raw = if as_base64 {
-            let content = std::str::from_utf8(bytes)?;
-            let filtered: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+            let s = std::str::from_utf8(bytes)?;
+            let filtered: String = s.chars().filter(|c| !c.is_whitespace()).collect();
             BASE64_STANDARD.decode(&filtered)?
         } else {
             bytes.to_vec()
         };
 
         let pfx = PFX::parse(&raw)?;
-        let password = password.unwrap_or("");
+        let pwd = password.unwrap_or("");
 
-        // Extract certificate and key from P12
-        // Note: This is simplified - you might need more robust P12 parsing
-        let cert_der = extract_cert_from_p12(&pfx, password)?;
-
-        // Parse the certificate with x509_parser
-        let (_, cert) = X509Certificate::from_der(&cert_der)?;
-        let owned_cert = cert.to_owned();
-
-        // Extract certificate information
-        let common_name = extract_common_name(&owned_cert)?;
-        let (not_before, not_after) = extract_validity(&owned_cert)?;
-        let is_ca = is_ca_certificate(&owned_cert);
-
-        let p12_data = if as_base64 {
-            std::str::from_utf8(bytes)?.to_string()
-        } else {
-            BASE64_STANDARD.encode(&raw)
-        };
-
+        if !pfx.verify_mac(pwd) {
+            return Err("PFX MAC verification failed".into());
+        }
+        // Build cert_data to store entire original P12 content
         let cert_data = CertData::P12 {
-            data: p12_data,
-            password: password.to_string(),
+            data: if as_base64 {
+                String::from_utf8(bytes.to_vec())?
+            } else {
+                base64::encode(&raw)
+            },
+            password: pwd.to_string(),
             as_base64,
         };
+        let certs = pfx.cert_bags(pwd)?;
+        let mut leaf_cert: Option<X509Certificate> = None;
 
-        Ok(CertificateConfig {
-            cert_data,
-            parsed_cert: Some(owned_cert),
-            common_name,
-            not_before,
-            not_after,
-            is_ca,
-        })
+        // Iterate through all certificates
+        for der in &certs {
+            let (_, cert) = X509Certificate::from_der(der)?;
+            // Check if it's a leaf cert (subject != issuer typically)
+            if cert.subject() != cert.issuer() {
+                leaf_cert = Some(cert.to_owned());
+                break;
+            }
+        }
+
+        let cert = leaf_cert.ok_or("No leaf certificate found in PFX")?;
+        let cert = get_cert_info(cert, cert_data)?;
+
+        Ok(cert)
     }
-}
 
-
-fn from_x509_and_key(cert: X509, key: Option<PKey<Private>>, cert_data: CertData) -> Self {
-        // Extract certificate information
-        let cert = get_cert_info(&cert, cert_data).unwrap();
-        println!("{:?}", cert);
-        cert
-    }
-
-    // pub fn generate_ca(config: CaConfig) -> Result<Self, CertMgtError> {
-    //     let (cert, key_pair) = Self::mk_ca_cert(&config)?;
-    //
-    //     // Convert to PEM format
-    //     let cert_pem = String::from_utf8(cert.to_pem()?)?;
-    //     let key_pem = String::from_utf8(key_pair.private_key_to_pem_pkcs8()?)?;
-    //
-    //     let cert_data = CertData::Pem {
-    //         cert: cert_pem,
-    //         key: Some(key_pem),
-    //     };
-    //
-    //     Ok(Self::from_x509_and_key(cert, Some(key_pair), cert_data))
-    // }
-    //
-    // /// Generate a server certificate signed by the provided CA
-    // pub fn generate_server_cert(
-    //     config: ServerCertConfig,
-    //     ca_cert: &CertificateConfig,
-    // ) -> Result<Self, CertMgtError> {
-    //     // Extract CA certificate and key
-    //     let ca_x509 = match &ca_cert.cert_data {
-    //         CertData::Pem { cert, .. } => X509::from_pem(cert.as_bytes())?,
-    //         CertData::P12 { .. } => {
-    //             return Err(CertMgtError::InvalidConfiguration(
-    //                 "P12 CA certificates not supported for signing".to_string()
-    //             ))
-    //         }
-    //     };
-    //
-    //     let ca_key = match &ca_cert.cert_data {
-    //         CertData::Pem { key: Some(key), .. } => PKey::private_key_from_pem(key.as_bytes())?,
-    //         _ => {
-    //             return Err(CertMgtError::InvalidConfiguration(
-    //                 "CA certificate must have a private key".to_string()
-    //             ))
-    //         }
-    //     };
-    //
-    //     let (cert, key_pair) = Self::mk_ca_signed_cert(&config, &ca_x509, &ca_key)?;
-    //
-    //     // Convert to PEM format
-    //     let cert_pem = String::from_utf8(cert.to_pem()?)?;
-    //     let key_pem = String::from_utf8(key_pair.private_key_to_pem_pkcs8()?)?;
-    //
-    //     let cert_data = CertData::Pem {
-    //         cert: cert_pem,
-    //         key: Some(key_pem),
-    //     };
-    //
-    //     Ok(Self::from_x509_and_key(cert, Some(key_pair), cert_data))
-    // }
-    //
-    // /// Renew an existing certificate with the same configuration but new validity period
-    // pub fn renew_with_ca(
-    //     &self,
-    //     ca_cert: &CertificateConfig,
-    //     new_validity_days: u32,
-    // ) -> Result<Self, CertMgtError> {
-    //     let config = ServerCertConfig {
-    //         country: self.country.clone(),
-    //         state: self.state.clone(),
-    //         organization: self.organization.clone(),
-    //         common_name: self.common_name.clone(),
-    //         alt_names: vec![], // You might want to extract this from the original cert
-    //         key_size: self.key_size.unwrap_or(2048),
-    //         validity_days: new_validity_days,
-    //     };
-    //
-    //     Self::generate_server_cert(config, ca_cert)
-    // }
-    //
-    // /// Verify that this certificate was issued by the given CA
-    // pub fn verify_with_ca(&self, ca_cert: &CertificateConfig) -> Result<bool, Box<dyn Error>> {
-    //     let cert_x509 = match &self.cert_data {
-    //         CertData::Pem { cert, .. } => X509::from_pem(cert.as_bytes())?,
-    //         CertData::P12 { .. } => return Err("P12 certificate verification not implemented".into()),
-    //     };
-    //
-    //     let ca_x509 = match &ca_cert.cert_data {
-    //         CertData::Pem { cert, .. } => X509::from_pem(cert.as_bytes())?,
-    //         CertData::P12 { .. } => return Err("P12 CA certificates not supported for verification".into()),
-    //     };
-    //
-    //     match ca_x509.issued(&cert_x509) {
-    //         X509VerifyResult::OK => Ok(true),
-    //         _ => Ok(false),
-    //     }
-    // }
-    //
-    // /// Save certificate and key to files
-    // pub fn save_to_files(&self, cert_path: &str, key_path: Option<&str>) -> Result<(), Box<dyn Error>> {
-    //     match &self.cert_data {
-    //         CertData::Pem { cert, key } => {
-    //             std::fs::write(cert_path, cert)?;
-    //
-    //             if let (Some(key_content), Some(key_file_path)) = (key, key_path) {
-    //                 std::fs::write(key_file_path, key_content)?;
-    //             }
-    //         }
-    //         CertData::P12 { data, .. } => {
-    //             // For P12, save the base64 data
-    //             std::fs::write(cert_path, data)?;
-    //         }
-    //     }
-    //     Ok(())
-    // }
-    //
-    // fn mk_ca_cert(config: &CaConfig) -> Result<(X509, PKey<Private>), ErrorStack> {
-    //     let rsa = Rsa::generate(config.key_size)?;
-    //     let key_pair = PKey::from_rsa(rsa)?;
-    //
-    //     let mut x509_name = X509NameBuilder::new()?;
-    //     x509_name.append_entry_by_text("C", &config.country)?;
-    //     x509_name.append_entry_by_text("ST", &config.state)?;
-    //     x509_name.append_entry_by_text("O", &config.organization)?;
-    //     x509_name.append_entry_by_text("CN", &config.common_name)?;
-    //     let x509_name = x509_name.build();
-    //
-    //     let mut cert_builder = X509::builder()?;
-    //     cert_builder.set_version(2)?;
-    //     let serial_number = {
-    //         let mut serial = BigNum::new()?;
-    //         serial.rand(159, MsbOption::MAYBE_ZERO, false)?;
-    //         serial.to_asn1_integer()?
-    //     };
-    //     cert_builder.set_serial_number(&serial_number)?;
-    //     cert_builder.set_subject_name(&x509_name)?;
-    //     cert_builder.set_issuer_name(&x509_name)?;
-    //     cert_builder.set_pubkey(&key_pair)?;
-    //     let not_before = Asn1Time::days_from_now(0)?;
-    //     cert_builder.set_not_before(&not_before)?;
-    //     let not_after = Asn1Time::days_from_now(config.validity_days)?;
-    //     cert_builder.set_not_after(&not_after)?;
-    //
-    //     cert_builder.append_extension(BasicConstraints::new().critical().ca().build()?)?;
-    //     cert_builder.append_extension(
-    //         KeyUsagePurpose::new()
-    //             .critical()
-    //             .key_cert_sign()
-    //             .crl_sign()
-    //             .build()?,
-    //     )?;
-    //
-    //     let subject_key_identifier =
-    //         SubjectKeyIdentifier::new().build(&cert_builder.x509v3_context(None, None))?;
-    //     cert_builder.append_extension(subject_key_identifier)?;
-    //
-    //     cert_builder.sign(&key_pair, MessageDigest::sha256())?;
-    //     let cert = cert_builder.build();
-    //
-    //     Ok((cert, key_pair))
-    // }
-    // Internal helper methods (adapted from your CLI code)
-    // fn mk_ca_cert(config: &CaConfig) -> Result<(X509, PKey<Private>), ErrorStack> {
-    //     let rsa = Rsa::generate(config.key_size)?;
-    //     let key_pair = PKey::from_rsa(rsa)?;
-    //
-    //     let mut x509_name = X509NameBuilder::new()?;
-    //     x509_name.append_entry_by_text("C", &config.country)?;
-    //     x509_name.append_entry_by_text("ST", &config.state)?;
-    //     x509_name.append_entry_by_text("O", &config.organization)?;
-    //     x509_name.append_entry_by_text("CN", &config.common_name)?;
-    //     let x509_name = x509_name.build();
-    //
-    //     let mut cert_builder = X509::builder()?;
-    //     cert_builder.set_version(2)?;
-    //     let serial_number = {
-    //         let mut serial = BigNum::new()?;
-    //         serial.rand(159, MsbOption::MAYBE_ZERO, false)?;
-    //         serial.to_asn1_integer()?
-    //     };
-    //     cert_builder.set_serial_number(&serial_number)?;
-    //     cert_builder.set_subject_name(&x509_name)?;
-    //     cert_builder.set_issuer_name(&x509_name)?;
-    //     cert_builder.set_pubkey(&key_pair)?;
-    //     let not_before = Asn1Time::days_from_now(0)?;
-    //     cert_builder.set_not_before(&not_before)?;
-    //     let not_after = Asn1Time::days_from_now(config.validity_days)?;
-    //     cert_builder.set_not_after(&not_after)?;
-    //
-    //     cert_builder.append_extension(BasicConstraints::new().critical().ca().build()?)?;
-    //     cert_builder.append_extension(
-    //         KeyUsagePurpose::new()
-    //             .critical()
-    //             .key_cert_sign()
-    //             .crl_sign()
-    //             .build()?,
-    //     )?;
-    //
-    //     let subject_key_identifier =
-    //         SubjectKeyIdentifier::new().build(&cert_builder.x509v3_context(None, None))?;
-    //     cert_builder.append_extension(subject_key_identifier)?;
-    //
-    //     cert_builder.sign(&key_pair, MessageDigest::sha256())?;
-    //     let cert = cert_builder.build();
-    //
-    //     Ok((cert, key_pair))
-    // }
-    //
-    // fn mk_ca_signed_cert(
-    //     config: &ServerCertConfig,
-    //     ca_cert: &X509Ref,
-    //     ca_key_pair: &PKey<Private>,
-    // ) -> Result<(X509, PKey<Private>), ErrorStack> {
-    //     let rsa = Rsa::generate(config.key_size as u32)?;
-    //     let key_pair = PKey::from_rsa(rsa)?;
-    //     let req = Self::mk_request(config, &key_pair)?;
-    //
-    //     let mut cert_builder = X509::builder()?;
-    //     cert_builder.set_version(2)?;
-    //     let serial_number = {
-    //         let mut serial = BigNum::new()?;
-    //         serial.rand(159, MsbOption::MAYBE_ZERO, false)?;
-    //         serial.to_asn1_integer()?
-    //     };
-    //     cert_builder.set_serial_number(&serial_number)?;
-    //     cert_builder.set_subject_name(req.subject_name())?;
-    //     cert_builder.set_issuer_name(ca_cert.subject_name())?;
-    //     cert_builder.set_pubkey(&key_pair)?;
-    //     let not_before = Asn1Time::days_from_now(0)?;
-    //     cert_builder.set_not_before(&not_before)?;
-    //     let not_after = Asn1Time::days_from_now(config.validity_days)?;
-    //     cert_builder.set_not_after(&not_after)?;
-    //
-    //     cert_builder.append_extension(BasicConstraints::new().build()?)?;
-    //
-    //     cert_builder.append_extension(
-    //         KeyUsagePurpose::new()
-    //             .critical()
-    //             .non_repudiation()
-    //             .digital_signature()
-    //             .key_encipherment()
-    //             .build()?,
-    //     )?;
-    //
-    //     let subject_key_identifier =
-    //         SubjectKeyIdentifier::new().build(&cert_builder.x509v3_context(Some(ca_cert), None))?;
-    //     cert_builder.append_extension(subject_key_identifier)?;
-    //
-    //     let auth_key_identifier = AuthorityKeyIdentifier::new()
-    //         .keyid(false)
-    //         .issuer(false)
-    //         .build(&cert_builder.x509v3_context(Some(ca_cert), None))?;
-    //     cert_builder.append_extension(auth_key_identifier)?;
-    //
-    //     let mut subject_alt_name = SubjectAlternativeName::new();
-    //     for dns in &config.alt_names {
-    //         subject_alt_name.dns(dns);
-    //     }
-    //     let alt_names = subject_alt_name.build(&cert_builder.x509v3_context(Some(ca_cert), None))?;
-    //     cert_builder.append_extension(alt_names)?;
-    //
-    //     cert_builder.sign(ca_key_pair, MessageDigest::sha256())?;
-    //     let cert = cert_builder.build();
-    //
-    //     Ok((cert, key_pair))
-    // }
-    //
-    // fn mk_request(config: &ServerCertConfig, key_pair: &PKey<Private>) -> Result<X509Req, ErrorStack> {
-    //     let mut req_builder = X509ReqBuilder::new()?;
-    //     req_builder.set_pubkey(key_pair)?;
-    //
-    //     let mut x509_name = X509NameBuilder::new()?;
-    //     x509_name.append_entry_by_text("C", &config.country)?;
-    //     x509_name.append_entry_by_text("ST", &config.state)?;
-    //     x509_name.append_entry_by_text("O", &config.organization)?;
-    //     x509_name.append_entry_by_text("CN", &config.common_name)?;
-    //     let x509_name = x509_name.build();
-    //     req_builder.set_subject_name(&x509_name)?;
-    //
-    //     req_builder.sign(key_pair, MessageDigest::sha256())?;
-    //     let req = req_builder.build();
-    //     Ok(req)
-    // }
-    /// Get the certificate as PEM string
     pub fn get_cert_pem(&self) -> Option<&str> {
         match &self.cert_data {
             CertData::Pem { cert, .. } => Some(cert),
@@ -868,20 +559,18 @@ fn get_key_size(cert: &X509Certificate) -> Option<usize> {
         .ok()
         .filter(|&bits| bits > 0)
 }
-fn get_cert_info(cert: &X509, cert_data: CertData) -> Result<CertificateConfig, Box<dyn std::error::Error>> {
-    let der = cert.to_der()?;
-    let (_, parsed) = X509Certificate::from_der(&der)?;
-    let serial_number = parsed.serial.to_string();
-    let is_ca = parsed.is_ca();
-    let not_after = asn1_time_to_timestamp(&parsed.validity.not_after);
-    let not_before = asn1_time_to_timestamp(&parsed.validity.not_before);
-    let country = get_subject_attr(&parsed, oid_registry::OID_X509_COUNTRY_NAME);
-    let state = get_subject_attr(&parsed, oid_registry::OID_X509_STATE_OR_PROVINCE_NAME);
-    let locality = get_subject_attr(&parsed, oid_registry::OID_X509_LOCALITY_NAME);
-    let organization = get_subject_attr(&parsed, oid_registry::OID_X509_ORGANIZATION_NAME);
-    let organizational_unit = get_subject_attr(&parsed, oid_registry::OID_X509_ORGANIZATIONAL_UNIT);
-    let common_name = get_subject_attr(&parsed, oid_registry::OID_X509_COMMON_NAME);
-    let key_size = get_key_size(&parsed);
+fn get_cert_info(cert: X509Certificate, cert_data: CertData) -> Result<CertificateConfig, Box<dyn std::error::Error>> {
+    let serial_number = cert.serial.to_string();
+    let is_ca = cert.is_ca();
+    let not_after = asn1_time_to_timestamp(&cert.validity.not_after);
+    let not_before = asn1_time_to_timestamp(&cert.validity.not_before);
+    let country = get_subject_attr(&cert, oid_registry::OID_X509_COUNTRY_NAME);
+    let state = get_subject_attr(&cert, oid_registry::OID_X509_STATE_OR_PROVINCE_NAME);
+    let locality = get_subject_attr(&cert, oid_registry::OID_X509_LOCALITY_NAME);
+    let organization = get_subject_attr(&cert, oid_registry::OID_X509_ORGANIZATION_NAME);
+    let organizational_unit = get_subject_attr(&cert, oid_registry::OID_X509_ORGANIZATIONAL_UNIT);
+    let common_name = get_subject_attr(&cert, oid_registry::OID_X509_COMMON_NAME);
+    let key_size = get_key_size(&cert);
     let cert = CertificateConfig {
         country,
         state,
