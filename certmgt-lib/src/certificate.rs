@@ -211,10 +211,9 @@ impl CertificateAuthority {
             KeyPair::generate()
         }.map_err(|e| CertMgtError::KeyGenerationError(e.to_string()))?;
 
-        ca_params.key_identifier() .key_pair = Some(key_pair);
 
         // Generate self-signed CA certificate
-        let ca_cert = ca_params.self_signed(&ca_params.key_pair.as_ref().unwrap())
+        let ca_cert = ca_params.self_signed(&key_pair)
             .map_err(|e| CertMgtError::CaGenerationError(e.to_string()))?;
 
         Ok(CertificateAuthority {
