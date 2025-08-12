@@ -9,7 +9,7 @@ use certmgt_lib::{
 use crate::json::*;
 use clap::{Parser, Subcommand};
 use serde::de::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use certmgt_lib::types::{CaConfig, ServerCertConfig};
 use crate::cli::{Commands, ListType};
 use crate::tui::launch_tui;
@@ -31,10 +31,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             let configs: Vec<CertificateConfig> = if is_database_file(&path) {
                 // Read from database file
-                let certificates: Vec<CertificateConfig> = match path.extension().and_then(|ext| ext.to_str()) {
-                    Some("gz") => load_certificates_from_json_compressed(&path)?,
-                    _ => load_certificates_from_json(&path)?,
-                };
+                let certificates = load_certificates_from_database(&path)?;
                 let filtered_configs = filter_certificates(certificates, filters.clone(), or_logic)?;
 
                 let logic_type = if or_logic { "OR" } else { "AND" };
@@ -208,19 +205,13 @@ fn main() -> anyhow::Result<()> {
                 );
                 all_filters.push("is_ca==true".to_string());
             }
+            let certificates = load_certificates_from_database(&database)?;
 
             let filtered_configs = if all_filters.is_empty() {
-                // Load all certificates if no filters
-                match load_certificates_from_database(&database) {
-                    Ok(configs) => configs,
-                    Err(e) => {
-                        eprintln!("Error loading database: {}", e);
-                        std::process::exit(1);
-                    }
-                }
+                certificates
             } else {
                 // Apply advanced filtering
-                match filter_certificates(&database, all_filters, or_logic) {
+                match filter_certificates(certificates, all_filters, or_logic) {
                     Ok(configs) => configs,
                     Err(e) => {
                         eprintln!("Error filtering certificates: {}", e);
@@ -257,8 +248,9 @@ fn main() -> anyhow::Result<()> {
             list_type,
         } => match list_type {
             ListType::WithoutKeys => {
+                let certificates = load_certificates_from_database(&database)?;
                 let configs = filter_certificates(
-                    &database,
+                    certificates,
                     vec!["has_private_key==false".to_string()],
                     false,
                 )?;
@@ -272,8 +264,9 @@ fn main() -> anyhow::Result<()> {
             }
 
             ListType::CAs => {
+                let certificates = load_certificates_from_database(&database)?;
                 let configs =
-                    filter_certificates(&database, vec!["is_ca==true".to_string()], false)?;
+                    filter_certificates(certificates, vec!["is_ca==true".to_string()], false)?;
                 println!("CA certificates ({} found):", configs.len());
                 for config in configs {
                     println!("  - {} ({})", config.common_name, config.organization);
@@ -281,12 +274,13 @@ fn main() -> anyhow::Result<()> {
             }
 
             ListType::Expiring { days } => {
+                let certificates = load_certificates_from_database(&database)?;
                 let threshold = chrono::Utc::now().timestamp() + (days * 24 * 60 * 60);
                 let filters = vec![
                     format!("not_after<={}", threshold),
                     format!("not_after>{}", chrono::Utc::now().timestamp()),
                 ];
-                let configs = filter_certificates(&database, filters, false)?;
+                let configs = filter_certificates(certificates, filters, false)?;
                 println!(
                     "Certificates expiring within {} days ({} found):",
                     days,
@@ -299,8 +293,9 @@ fn main() -> anyhow::Result<()> {
             }
 
             ListType::Expired => {
+                let certificates = load_certificates_from_database(&database)?;
                 let filter = format!("not_after<{}", chrono::Utc::now().timestamp());
-                let configs = filter_certificates(&database, vec![filter], false)?;
+                let configs = filter_certificates(certificates, vec![filter], false)?;
                 println!("Expired certificates ({} found):", configs.len());
                 for config in configs {
                     let days_ago = (chrono::Utc::now().timestamp() - config.not_after) / 86400;
@@ -309,8 +304,9 @@ fn main() -> anyhow::Result<()> {
             }
 
             ListType::ByOrg { pattern } => {
+                let certificates = load_certificates_from_database(&database)?;
                 let filter = format!("organization~{}", pattern);
-                let configs = filter_certificates(&database, vec![filter], false)?;
+                let configs = filter_certificates(certificates, vec![filter], false)?;
                 println!(
                     "Certificates with organization matching '{}' ({} found):",
                     pattern,
@@ -322,8 +318,9 @@ fn main() -> anyhow::Result<()> {
             }
 
             ListType::ByCN { pattern } => {
+                let certificates = load_certificates_from_database(&database)?;
                 let filter = format!("common_name~{}", pattern);
-                let configs = filter_certificates(&database, vec![filter], false)?;
+                let configs = filter_certificates(certificates, vec![filter], false)?;
                 println!(
                     "Certificates with common name matching '{}' ({} found):",
                     pattern,
@@ -509,7 +506,7 @@ fn main() -> anyhow::Result<()> {
             };
             let ca = CertificateConfig::new_ca(new_ca_config)?;
             println!("{:?}", ca.cert_data);
-            let cert = CertificateConfig::sign_certificate(&ca, &new_cert_config, /* u64 */)?;
+            let cert = CertificateConfig::sign_certificate(&ca, &new_cert_config, 1)?;
             save_certificates_to_json(vec![ca, cert], &database)?;
 
         }
