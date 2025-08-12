@@ -7,7 +7,6 @@ license.workspace = true
 description = "A library for managing X.509 certificates"
 
 [dependencies]
-openssl.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

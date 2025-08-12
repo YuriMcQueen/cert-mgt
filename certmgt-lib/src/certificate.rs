@@ -1,13 +1,11 @@
-use std::collections::HashMap;
 use crate::detection::detect_cert_type;
-use crate::types::{CaConfig, CertData, CertDataType, CertificateAuthority, CertificateConfig, ServerCertConfig};
-use crate::utils::{asn1_time_to_timestamp, parse_cert_field};
+use crate::types::{CaConfig, CertData, CertDataType, CertificateConfig, ServerCertConfig};
+use crate::utils::asn1_time_to_timestamp;
 use crate::CertMgtError;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine as _;
 
 use std::error::Error;
-use std::time::{SystemTime, UNIX_EPOCH};
 use p12::PFX;
 use pem::{parse, parse_many};
 use time::OffsetDateTime;
@@ -15,7 +13,7 @@ use x509_parser::asn1_rs::{FromDer, Oid};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::oid_registry;
 use x509_parser::public_key::PublicKey;
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, BasicConstraints, IsCa, SanType, Issuer};
+use rcgen::{ CertificateParams, DnType, KeyPair, BasicConstraints, IsCa, Issuer};
 
 impl CertificateConfig {
     pub fn read_from_path(path: &str, password: Option<&str>) -> Result<Self, Box<dyn Error>> {

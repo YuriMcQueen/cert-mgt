@@ -1,15 +1,5 @@
-use chrono::NaiveDateTime;
-use openssl::asn1::{Asn1Time, Asn1TimeRef};
-use openssl::nid::Nid;
-use openssl::x509::X509NameRef;
 use x509_parser::prelude::ASN1Time;
 
-pub fn parse_cert_field(cert: &X509NameRef, nid: Nid) -> Option<String> {
-    cert.entries_by_nid(nid)
-        .next()
-        .and_then(|entry| entry.data().as_utf8().ok())
-        .map(|data| data.to_string())
-}
 
 pub fn asn1_time_to_timestamp(asn1_time: &ASN1Time) -> i64 {
     asn1_time.timestamp()

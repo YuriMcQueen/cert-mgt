@@ -1,4 +1,3 @@
-use openssl::error::ErrorStack;
 use thiserror::Error;
 
 // Your existing error type
@@ -70,9 +69,6 @@ pub enum CertMgtError {
     #[error("AddrParse error")]
     AddrParseError(#[from] std::net::AddrParseError),
 
-    #[error("ErrorStack error")]
-    ErrorStack(#[from] ErrorStack ),
-    
     // Add this if you need to wrap other error types
     #[error("Other error: {0}")]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
