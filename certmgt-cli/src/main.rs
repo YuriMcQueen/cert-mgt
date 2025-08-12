@@ -1,18 +1,12 @@
 mod tui;
 mod cli;
-
+mod json;
 use certmgt_lib::filters::filter_certificates;
-use certmgt_lib::json::export_all_certificates;
 use certmgt_lib::{
     CertMgtError,
-    CertificateConfig,
-    attach_private_key_to_certificate,
-    list_all_certificate_names,
-    load_certificates_from_json,
-    load_certificates_from_json_compressed,
-    save_certificates_to_json,
-    save_certificates_to_json_compressed,
+    CertificateConfig
 };
+use crate::json::*;
 use clap::{Parser, Subcommand};
 use serde::de::Error;
 use std::path::PathBuf;
@@ -37,7 +31,11 @@ fn main() -> anyhow::Result<()> {
         } => {
             let configs: Vec<CertificateConfig> = if is_database_file(&path) {
                 // Read from database file
-                let filtered_configs = filter_certificates(&path, filters.clone(), or_logic)?;
+                let certificates: Vec<CertificateConfig> = match path.extension().and_then(|ext| ext.to_str()) {
+                    Some("gz") => load_certificates_from_json_compressed(&path)?,
+                    _ => load_certificates_from_json(&path)?,
+                };
+                let filtered_configs = filter_certificates(certificates, filters.clone(), or_logic)?;
 
                 let logic_type = if or_logic { "OR" } else { "AND" };
                 println!(
@@ -509,9 +507,9 @@ fn main() -> anyhow::Result<()> {
                 key_size: key_size as usize,
                 validity_days,
             };
-            let ca = CertificateConfig::generate_ca(new_ca_config)?;
+            let ca = CertificateConfig::new_ca(new_ca_config)?;
             println!("{:?}", ca.cert_data);
-            let cert = CertificateConfig::generate_server_cert(new_cert_config, &ca)?;
+            let cert = CertificateConfig::sign_certificate(&ca, &new_cert_config, /* u64 */)?;
             save_certificates_to_json(vec![ca, cert], &database)?;
 
         }

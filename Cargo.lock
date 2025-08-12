@@ -241,11 +241,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "base64",
  "certmgt-lib",
  "chrono",
  "clap",
  "crossterm 0.29.0",
  "dirs",
+ "flate2",
+ "pem",
  "predicates 2.1.5",
  "ratatui",
  "rpassword",
@@ -1237,6 +1240,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -2061,6 +2065,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror",
  "time",

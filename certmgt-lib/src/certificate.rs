@@ -15,7 +15,7 @@ use x509_parser::asn1_rs::{FromDer, Oid};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::oid_registry;
 use x509_parser::public_key::PublicKey;
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, BasicConstraints, IsCa, SanType};
+use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, BasicConstraints, IsCa, SanType, Issuer};
 
 impl CertificateConfig {
     pub fn read_from_path(path: &str, password: Option<&str>) -> Result<Self, Box<dyn Error>> {
@@ -163,26 +163,14 @@ impl CertificateConfig {
         }
     }
 
-    /// Check if this certificate has a private key
-    pub fn has_private_key(&self) -> bool {
-        match &self.cert_data {
-            CertData::Pem { key, .. } => key.is_some(),
-            CertData::P12 { .. } => true, // P12 always contains both cert and key
-        }
-    }
-}
-
-
-
-impl CertificateAuthority {
-    /// Creates a new Certificate Authority from CaConfig
-    pub fn new(config: CaConfig) -> Result<Self, CertMgtError> {
+    /// Create a new CA certificate
+    pub fn new_ca(config: CaConfig) -> Result<Self, CertMgtError> {
         // Create CA certificate parameters
         let mut ca_params = CertificateParams::new(vec![config.common_name.clone()])
             .map_err(|e| CertMgtError::CaGenerationError(e.to_string()))?;
 
         // Set up distinguished name
-        let mut distinguished_name = DistinguishedName::new();
+        let mut distinguished_name = rcgen::DistinguishedName::new();
         distinguished_name.push(DnType::CommonName, &config.common_name);
         distinguished_name.push(DnType::OrganizationName, &config.organization);
         distinguished_name.push(DnType::StateOrProvinceName, &config.state);
@@ -199,40 +187,65 @@ impl CertificateAuthority {
 
         // Set key usage for CA
         ca_params.key_usages = vec![
-            KeyUsagePurpose::KeyCertSign,
-            KeyUsagePurpose::CrlSign,
-            KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
         ];
 
-        // Generate key pair with specified size
-        let key_pair: KeyPair = if config.key_size == 4096 {
+        // Generate key pair
+        let key_pair = if config.key_size == 4096 {
             KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
         } else {
             KeyPair::generate()
         }.map_err(|e| CertMgtError::KeyGenerationError(e.to_string()))?;
 
-
         // Generate self-signed CA certificate
         let ca_cert = ca_params.self_signed(&key_pair)
             .map_err(|e| CertMgtError::CaGenerationError(e.to_string()))?;
 
-        Ok(CertificateAuthority {
-            ca_cert,
-            ca_config: config,
-            serial_counter: 1,
-            issued_certificates: HashMap::new(),
+        // Create certificate data
+        let cert_pem = ca_cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        Ok(CertificateConfig {
+            country: config.country,
+            state: config.state,
+            locality: "".to_string(),
+            organization: config.organization,
+            organizational_unit: "".to_string(),
+            common_name: config.common_name,
+            is_ca: true,
+            not_before: now.unix_timestamp(),
+            not_after: (now + time::Duration::days(config.validity_days as i64)).unix_timestamp(),
+            key_size: Some(config.key_size as usize),
+            cert_data: CertData::Pem {
+                cert: cert_pem,
+                key: Some(key_pem)
+            },
+            serial_number: "1".to_string(),
         })
     }
 
+    /// Sign a server certificate using this CA
+    pub fn sign_certificate(
+        &self,
+        config: &ServerCertConfig,
+        next_serial: u64
+    ) -> Result<CertificateConfig, CertMgtError> {
+        // Verify this is a CA certificate
+        if !self.is_ca {
+            return Err(CertMgtError::InvalidConfiguration("Not a CA certificate".to_string()));
+        }
 
-    /// Signs a server certificate based on ServerCertConfig
-    pub fn sign_server_certificate(&mut self, config: &ServerCertConfig, cert_data_type: CertDataType) -> Result<CertificateConfig, CertMgtError> {
+        // Create issuer from this CA
+        let issuer = self.create_issuer()?;
+
         // Create certificate parameters
         let mut cert_params = CertificateParams::new(vec![config.common_name.clone()])
             .map_err(|e| CertMgtError::CertificateGenerationError(e.to_string()))?;
 
         // Set up distinguished name
-        let mut distinguished_name = DistinguishedName::new();
+        let mut distinguished_name = rcgen::DistinguishedName::new();
         distinguished_name.push(DnType::CommonName, &config.common_name);
         distinguished_name.push(DnType::OrganizationName, &config.organization);
         distinguished_name.push(DnType::StateOrProvinceName, &config.state);
@@ -249,289 +262,251 @@ impl CertificateAuthority {
 
         // Set key usage for server certificate
         cert_params.key_usages = vec![
-            KeyUsagePurpose::DigitalSignature,
-            KeyUsagePurpose::KeyEncipherment,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
         ];
-        cert_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        cert_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+
+        // Enable authority key identifier extension
+        cert_params.use_authority_key_identifier_extension = true;
 
         // Add subject alternative names
         for san in &config.alt_names {
             if san.parse::<std::net::IpAddr>().is_ok() {
-                cert_params.subject_alt_names.push(SanType::IpAddress(san.parse().unwrap()));
+                cert_params.subject_alt_names.push(rcgen::SanType::IpAddress(san.parse().unwrap()));
             } else {
-                cert_params.subject_alt_names.push(SanType::DnsName(san.clone()));
+                cert_params.subject_alt_names.push(rcgen::SanType::DnsName(san.parse().unwrap()));
             }
         }
 
-        // Generate key pair with specified size
+        // Generate key pair for the new certificate
         let key_pair = if config.key_size == 4096 {
             KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
         } else {
             KeyPair::generate()
         }.map_err(|e| CertMgtError::KeyGenerationError(e.to_string()))?;
 
-        cert_params.key_pair = Some(key_pair);
+        // Set serial number
+        cert_params.serial_number = Some(next_serial.into());
 
-        // Increment serial number
-        self.serial_counter += 1;
-        cert_params.serial_number = Some(self.serial_counter.into());
-
-        // Sign the certificate with CA
-        let certificate = cert_params.signed_by(&self.ca_cert, &self.ca_cert.key_pair().unwrap())
+        // Sign the certificate
+        let certificate = cert_params.signed_by(&key_pair, &issuer)
             .map_err(|e| CertMgtError::CertificateSigningError(e.to_string()))?;
 
-        // Create CertificateConfig based on requested format
-        let cert_data = self.create_cert_data(&certificate, cert_data_type, "changeme")?;
+        // Create certificate data
+        let cert_pem = certificate.pem();
+        let key_pem = key_pair.serialize_pem();
 
-        let cert_config = CertificateConfig {
+        Ok(CertificateConfig {
             country: config.country.clone(),
             state: config.state.clone(),
-            locality: "".to_string(), // Not specified in ServerCertConfig
+            locality: "".to_string(),
             organization: config.organization.clone(),
-            organizational_unit: "".to_string(), // Not specified in ServerCertConfig
+            organizational_unit: "".to_string(),
             common_name: config.common_name.clone(),
             is_ca: false,
             not_before: now.unix_timestamp(),
             not_after: (now + time::Duration::days(config.validity_days as i64)).unix_timestamp(),
             key_size: Some(config.key_size),
-            cert_data,
-            serial_number: ,
-        };
-
-        // Store the issued certificate
-        self.issued_certificates.insert(config.common_name.clone(), cert_config.clone());
-
-        Ok(cert_config)
+            cert_data: CertData::Pem {
+                cert: cert_pem,
+                key: Some(key_pem)
+            },
+            serial_number: next_serial.to_string(),
+        })
     }
 
-    /// Creates a custom certificate from a full CertificateConfig (for renewal scenarios)
-    pub fn sign_certificate_from_config(&mut self, config: &CertificateConfig, cert_data_type: CertDataType) -> Result<CertificateConfig, CertMgtError> {
-        // Create certificate parameters
-        let mut cert_params = CertificateParams::new(vec![config.common_name.clone()])
-            .map_err(|e| CertMgtError::CertificateGenerationError(e.to_string()))?;
-
-        // Set up distinguished name
-        let mut distinguished_name = DistinguishedName::new();
-        distinguished_name.push(DnType::CommonName, &config.common_name);
-        distinguished_name.push(DnType::OrganizationName, &config.organization);
-        distinguished_name.push(DnType::OrganizationalUnitName, &config.organizational_unit);
-        distinguished_name.push(DnType::StateOrProvinceName, &config.state);
-        distinguished_name.push(DnType::LocalityName, &config.locality);
-        distinguished_name.push(DnType::CountryName, &config.country);
-        cert_params.distinguished_name = distinguished_name;
-
-        // Set CA flag
-        cert_params.is_ca = if config.is_ca {
-            IsCa::Ca(BasicConstraints::Constrained(0))
-        } else {
-            IsCa::NoCa
-        };
-
-        // Set validity period from config timestamps
-        let not_before = OffsetDateTime::from_unix_timestamp(config.not_before)
-            .map_err(|e| CertMgtError::CertificateGenerationError(e.to_string()))?;
-        let not_after = OffsetDateTime::from_unix_timestamp(config.not_after)
-            .map_err(|e| CertMgtError::CertificateGenerationError(e.to_string()))?;
-
-        cert_params.not_before = not_before;
-        cert_params.not_after = not_after;
-
-        // Set key usage based on certificate type
-        if config.is_ca {
-            cert_params.key_usages = vec![
-                KeyUsagePurpose::KeyCertSign,
-                KeyUsagePurpose::CrlSign,
-                KeyUsagePurpose::DigitalSignature,
-            ];
-        } else {
-            cert_params.key_usages = vec![
-                KeyUsagePurpose::DigitalSignature,
-                KeyUsagePurpose::KeyEncipherment,
-            ];
-            cert_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    /// Renew this certificate with the same key pair
+    pub fn renew_with_ca(
+        &self,
+        ca_cert: &CertificateConfig,
+        new_validity_days: u32,
+        next_serial: u64
+    ) -> Result<CertificateConfig, CertMgtError> {
+        if self.is_ca {
+            return Err(CertMgtError::InvalidConfiguration("Cannot renew CA certificates".to_string()));
         }
 
-        // Generate key pair
-        let key_size = config.key_size.unwrap_or(2048);
-        let key_pair = if key_size == 4096 {
-            KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
-        } else {
-            KeyPair::generate()
-        }.map_err(|e| CertMgtError::KeyGenerationError(e.to_string()))?;
+        // Extract existing private key
+        let existing_key_pair = self.extract_private_key()?;
 
-        cert_params.key_pair = Some(key_pair);
+        // Create renewed config with same parameters but new validity
+        let renewed_config = ServerCertConfig {
+            common_name: self.common_name.clone(),
+            organization: self.organization.clone(),
+            state: self.state.clone(),
+            country: self.country.clone(),
+            validity_days: new_validity_days,
+            key_size: self.key_size.unwrap_or(2048),
+            alt_names: vec![], // You'd need to store/extract SANs if needed
+        };
 
-        // Increment serial number
-        self.serial_counter += 1;
-        cert_params.serial_number = Some(self.serial_counter.into());
+        // Create issuer from CA
+        let issuer = ca_cert.create_issuer()?;
 
-        // Sign the certificate
-        let certificate = cert_params.signed_by(&self.ca_cert, &self.ca_cert.key_pair().unwrap())
+        // Create new certificate with same key
+        let mut cert_params = CertificateParams::new(vec![renewed_config.common_name.clone()])
+            .map_err(|e| CertMgtError::CertificateGenerationError(e.to_string()))?;
+
+        // Set up parameters (similar to sign_certificate)
+        // ... (parameter setup code)
+
+        let now = OffsetDateTime::now_utc();
+        cert_params.not_before = now;
+        cert_params.not_after = now + time::Duration::days(new_validity_days as i64);
+        cert_params.serial_number = Some(next_serial.into());
+
+        // Sign with existing key pair
+        let certificate = cert_params.signed_by(&existing_key_pair, &issuer)
             .map_err(|e| CertMgtError::CertificateSigningError(e.to_string()))?;
 
-        // Create CertData based on requested format
-        let cert_data = self.create_cert_data(&certificate, cert_data_type, "changeme")?;
-
-        let mut new_config = config.clone();
-        new_config.cert_data = cert_data;
-        new_config.key_size = Some(key_size);
-
-        // Store the issued certificate
-        self.issued_certificates.insert(config.common_name.clone(), new_config.clone());
-
-        Ok(new_config)
-    }
-
-    /// Renews an existing certificate with extended validity
-    pub fn renew_certificate(&mut self, common_name: &str, new_validity_days: u32, cert_data_type: CertDataType) -> Result<CertificateConfig, CertMgtError> {
-        // Get the original certificate config
-        let mut original_config = self.issued_certificates.get(common_name)
-            .ok_or_else(|| CertMgtError::CertificateNotFound(common_name.to_string()))?
-            .clone();
-
-        // Update validity period
-        let now = OffsetDateTime::now_utc();
-        original_config.not_before = now.unix_timestamp();
-        original_config.not_after = (now + time::Duration::days(new_validity_days as i64)).unix_timestamp();
-
-        // Sign the renewed certificate
-        self.sign_certificate_from_config(&original_config, cert_data_type)
-    }
-
-    /// Creates CertData in the requested format
-    fn create_cert_data(&self, certificate: &Certificate, cert_data_type: CertDataType, p12_password: &str) -> Result<CertData, CertMgtError> {
-        match cert_data_type {
-            CertDataType::PemOnlyCert => {
-                Ok(CertData::Pem {
-                    cert: certificate.pem(),
-                    key: None,
-                })
-            }
-            CertDataType::PemOnlyKey => {
-                let key_pem = certificate.key_pair()
-                    .ok_or_else(|| CertMgtError::InvalidPrivateKey("Certificate has no private key".to_string()))?
-                    .serialize_pem();
-                Ok(CertData::Pem {
-                    cert: "".to_string(),
-                    key: Some(key_pem),
-                })
-            }
-            CertDataType::PemCertAndKey => {
-                let key_pem = certificate.key_pair()
-                    .ok_or_else(|| CertMgtError::InvalidPrivateKey("Certificate has no private key".to_string()))?
-                    .serialize_pem();
-                Ok(CertData::Pem {
-                    cert: certificate.pem(),
-                    key: Some(key_pem),
-                })
-            }
-            CertDataType::P12 { as_base64 } => {
-                self.create_p12_data(certificate, p12_password, as_base64)
-            }
-        }
-
-
-    }
-    fn create_p12_data(&self, certificate: &Certificate, password: &str, as_base64: bool) -> Result<CertData, CaError> {
-        // For P12 creation, we need to use external crate like `p12`
-        // This is a simplified implementation - you'd need proper P12 creation
-        let cert_der = certificate.der();
-        let key_der = certificate.key_pair()
-            .ok_or_else(|| CaError::Serialization("Certificate has no private key".to_string()))?
-            .serialize_der();
-
-        // Create a simple P12 structure (this is simplified - use proper p12 crate)
-        let p12_data = format!("P12-DATA-{}-{}",
-                               base64::engine::general_purpose::STANDARD.encode(&cert_der),
-                               base64::engine::general_purpose::STANDARD.encode(&key_der)
-        );
-
-        let data = if as_base64 {
-            base64::engine::general_purpose::STANDARD.encode(p12_data.as_bytes())
-        } else {
-            p12_data
-        };
-
-        Ok(CertData::P12 {
-            data,
-            password: password.to_string(),
-            as_base64,
-        })
-    }
-
-    /// Exports all issued certificates as JSON
-    pub fn export_certificates_json(&self) -> Result<String, CertMgtError> {
-        let certificates: Vec<&CertificateConfig> = self.issued_certificates.values().collect();
-        serde_json::to_string_pretty(&certificates)
-            .map_err(|e| CertMgtError::JsonError(e))
-    }
-
-    /// Imports certificates from JSON
-    pub fn import_certificates_json(&mut self, json_data: &str) -> Result<usize, CertMgtError> {
-        let certificates: Vec<CertificateConfig> = serde_json::from_str(json_data)
-            .map_err(|e| CertMgtError::JsonError(e))?;
-
-        let count = certificates.len();
-        for cert_config in certificates {
-            self.issued_certificates.insert(cert_config.common_name.clone(), cert_config);
-        }
-
-        Ok(count)
-    }
-
-    /// Gets the CA certificate as CertificateConfig
-    pub fn get_ca_certificate_config(&self) -> Result<CertificateConfig, CertMgtError> {
-        let now = OffsetDateTime::now_utc();
-        let validity_end = now + time::Duration::days(self.ca_config.validity_days as i64);
-
-        let cert_data = CertData::Pem {
-            cert: self.ca_cert.pem(),
-            key: Some(self.ca_cert.key_pair()
-                .ok_or_else(|| CertMgtError::Serialization("CA has no private key".to_string()))?
-                .serialize_pem()),
-        };
+        let cert_pem = certificate.pem();
+        let key_pem = existing_key_pair.serialize_pem();
 
         Ok(CertificateConfig {
-            country: self.ca_config.country.clone(),
-            state: self.ca_config.state.clone(),
-            locality: "".to_string(),
-            organization: self.ca_config.organization.clone(),
-            organizational_unit: "".to_string(),
-            common_name: self.ca_config.common_name.clone(),
-            is_ca: true,
+            country: self.country.clone(),
+            state: self.state.clone(),
+            locality: self.locality.clone(),
+            organization: self.organization.clone(),
+            organizational_unit: self.organizational_unit.clone(),
+            common_name: self.common_name.clone(),
+            is_ca: false,
             not_before: now.unix_timestamp(),
-            not_after: validity_end.unix_timestamp(),
-            key_size: Some(self.ca_config.key_size.try_into().unwrap()),
-            cert_data,
-            serial_number: "".to_string(),
+            not_after: (now + time::Duration::days(new_validity_days as i64)).unix_timestamp(),
+            key_size: self.key_size,
+            cert_data: CertData::Pem {
+                cert: cert_pem,
+                key: Some(key_pem)
+            },
+            serial_number: next_serial.to_string(),
         })
     }
 
-    /// Lists all issued certificates
-    pub fn list_issued_certificates(&self) -> Vec<&CertificateConfig> {
-        self.issued_certificates.values().collect()
+    /// Check if certificate needs renewal
+    pub fn needs_renewal(&self, threshold_days: u32) -> bool {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expiry_threshold = self.not_after - (threshold_days as i64 * 24 * 60 * 60);
+        now >= expiry_threshold
     }
 
-    /// Gets a specific certificate config
-    pub fn get_certificate_config(&self, common_name: &str) -> Option<&CertificateConfig> {
-        self.issued_certificates.get(common_name)
+    /// Get days until expiration
+    pub fn days_until_expiry(&self) -> i64 {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        (self.not_after - now) / (24 * 60 * 60)
     }
 
-    /// Validates if a certificate is still valid based on timestamps
-    pub fn is_certificate_valid(&self, common_name: &str) -> bool {
-        if let Some(cert_config) = self.issued_certificates.get(common_name) {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-            now >= cert_config.not_before && now <= cert_config.not_after
-        } else {
-            false
+    /// Check if certificate is expired
+    pub fn is_expired(&self) -> bool {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        now > self.not_after
+    }
+
+    /// Validate certificate data integrity
+    pub fn validate(&self) -> Result<(), CertMgtError> {
+        match &self.cert_data {
+            CertData::Pem { cert, .. } => {
+                // Parse the PEM first
+                let pem = pem::parse(cert)
+                    .map_err(|e| CertMgtError::InvalidConfiguration(format!("Invalid PEM format: {}", e)))?;
+
+                // Then parse the certificate
+                let (_remainder, _cert) = X509Certificate::from_der(&pem.contents())
+                    .map_err(|e| CertMgtError::InvalidConfiguration(format!("Invalid certificate: {}", e)))?;
+
+                Ok(())
+            }
+            CertData::P12 { .. } => {
+                Ok(())
+            }
         }
     }
 
-    /// Removes a certificate from the issued certificates list
-    pub fn revoke_certificate(&mut self, common_name: &str) -> Result<CertificateConfig, CertMgtError> {
-        self.issued_certificates.remove(common_name)
-            .ok_or_else(|| CertMgtError::InvalidInput(format!("Certificate for '{}' not found", common_name)))
+    /// Export certificate in PEM format
+    pub fn export_pem(&self) -> Result<String, CertMgtError> {
+        match &self.cert_data {
+            CertData::Pem { cert, key } => {
+                let mut pem_content = cert.clone();
+                if let Some(key_data) = key {
+                    if !key_data.is_empty() {
+                        pem_content.push('\n');
+                        pem_content.push_str(key_data);
+                    }
+                }
+                Ok(pem_content)
+            }
+            _ => Err(CertMgtError::UnsupportedCertFormat("Certificate is not in PEM format".to_string())),
+        }
+    }
 
+    /// Check if certificate has a private key
+    pub fn has_private_key(&self) -> bool {
+        match &self.cert_data {
+            CertData::Pem { key: Some(key_data), .. } => !key_data.is_empty(),
+            CertData::P12 { .. } => true, // P12 always contains private key
+            _ => false,
+        }
+    }
+
+    // Private helper methods
+    fn create_issuer(&self) -> Result<Issuer<'_, KeyPair>, CertMgtError> {
+        if !self.is_ca {
+            return Err(CertMgtError::InvalidConfiguration("Not a CA certificate".to_string()));
+        }
+
+        let (cert_pem, key_pem) = match &self.cert_data {
+            CertData::Pem { cert, key: Some(key) } => (cert, key),
+            CertData::Pem { key: None, .. } => {
+                return Err(CertMgtError::KeyLoadError("CA certificate has no private key".to_string()));
+            }
+            _ => return Err(CertMgtError::UnsupportedCertFormat("Expected PEM format".to_string())),
+        };
+
+        let signing_key = KeyPair::from_pem(key_pem)
+            .map_err(|e| CertMgtError::KeyLoadError(e.to_string()))?;
+
+        Issuer::from_ca_cert_pem(cert_pem, signing_key)
+            .map_err(|e| CertMgtError::IssuerCreationError(e.to_string()))
+    }
+
+    fn extract_private_key(&self) -> Result<KeyPair, CertMgtError> {
+        match &self.cert_data {
+            CertData::Pem { key: Some(key_pem), .. } => {
+                KeyPair::from_pem(key_pem)
+                    .map_err(|e| CertMgtError::KeyExtractionError(e.to_string()))
+            }
+            CertData::Pem { key: None, .. } => {
+                Err(CertMgtError::KeyExtractionError("Certificate has no private key".to_string()))
+            }
+            _ => Err(CertMgtError::UnsupportedCertFormat("Expected PEM format".to_string())),
+        }
+    }
+}
+
+// Utility functions that work with collections of CertificateConfig
+impl CertificateConfig {
+    /// Find CA certificate from a collection
+    pub fn find_ca(certificates: &[CertificateConfig]) -> Option<&CertificateConfig> {
+        certificates.iter().find(|cert| cert.is_ca)
+    }
+
+    /// Find certificates expiring within threshold days
+    pub fn find_expiring(certificates: &[CertificateConfig], threshold_days: u32) -> Vec<&CertificateConfig> {
+        certificates.iter()
+            .filter(|cert| cert.needs_renewal(threshold_days))
+            .collect()
+    }
+
+    /// Find certificate by common name
+    pub fn find_by_common_name<'a>(certificates: &'a [CertificateConfig], common_name: &str) -> Option<&'a CertificateConfig> {
+        certificates.iter().find(|cert| cert.common_name == common_name)
+    }
+
+    /// Get next serial number from existing certificates
+    pub fn get_next_serial(certificates: &[CertificateConfig]) -> u64 {
+        certificates.iter()
+            .filter_map(|cert| cert.serial_number.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0) + 1
     }
 }
 

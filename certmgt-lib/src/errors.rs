@@ -1,3 +1,4 @@
+use openssl::error::ErrorStack;
 use thiserror::Error;
 
 // Your existing error type
@@ -18,11 +19,23 @@ pub enum CertMgtError {
     #[error("Certificate generation failed: {0}")]
     CertificateGenerationError(String),
 
+    #[error("Invalid certificate format: {0}")]
+    UnsupportedCertFormat(String),
+
     #[error("CA generation failed: {0}")]
     CaGenerationError(String),
 
     #[error("Key generation failed: {0}")]
     KeyGenerationError(String),
+
+    #[error("Error extracting key: {0}")]
+    KeyExtractionError(String),
+
+    #[error("Error creating issuer: {0}")]
+    IssuerCreationError(String),
+
+    #[error("Error loading key: {0}")]
+    KeyLoadError(String),
 
     #[error("Certificate signing failed: {0}")]
     CertificateSigningError(String),
@@ -51,9 +64,15 @@ pub enum CertMgtError {
     #[error("JSON error")]
     JsonError(#[from] serde_json::Error),
 
-    #[error("OpenSSL error")]
-    OpensslError(#[from] openssl::error::ErrorStack),
+    #[error("Rcgen error")]
+    RcGenError(#[from] rcgen::Error),
 
+    #[error("AddrParse error")]
+    AddrParseError(#[from] std::net::AddrParseError),
+
+    #[error("ErrorStack error")]
+    ErrorStack(#[from] ErrorStack ),
+    
     // Add this if you need to wrap other error types
     #[error("Other error: {0}")]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),

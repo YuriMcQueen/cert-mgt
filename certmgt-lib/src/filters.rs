@@ -1,6 +1,5 @@
 use crate::{
-    CertData, CertMgtError, CertificateConfig, load_certificates_from_json,
-    load_certificates_from_json_compressed,
+    CertData, CertMgtError, CertificateConfig,
 };
 use std::path::Path;
 use std::str::FromStr;
@@ -239,22 +238,18 @@ impl FilterExpression {
 }
 // Main generic filter function
 pub fn filter_certificates(
-    json_path: &Path,
+    certificates: Vec<CertificateConfig>,
     filters: Vec<String>,
     use_or_logic: bool,
 ) -> Result<Vec<CertificateConfig>, CertMgtError> {
-    let configs = match json_path.extension().and_then(|ext| ext.to_str()) {
-        Some("gz") => load_certificates_from_json_compressed(json_path)?,
-        _ => load_certificates_from_json(json_path)?,
-    };
 
     if filters.is_empty() {
-        return Ok(configs);
+        return Ok(certificates);
     }
 
     let filter_logic = FilterLogic::from_strings(filters, use_or_logic)?;
 
-    Ok(configs
+    Ok(certificates
         .into_iter()
         .filter(|config| filter_logic.matches(config))
         .collect())
@@ -262,15 +257,15 @@ pub fn filter_certificates(
 
 // Convenience functions for common operations
 pub fn filter_certificates_simple(
-    json_path: &Path,
+    certificates: Vec<CertificateConfig>,
     filter_str: &str,
 ) -> Result<Vec<CertificateConfig>, CertMgtError> {
-    filter_certificates(json_path, vec![filter_str.to_string()], false)
+    filter_certificates(certificates, vec![filter_str.to_string()], false)
 }
 
 // Updated versions of your existing functions using the new filter system
-pub fn list_certificates_without_keys(json_path: &Path) -> Result<Vec<String>, CertMgtError> {
-    let filtered = filter_certificates_simple(json_path, "has_private_key==false")?;
+pub fn list_certificates_without_keys(certificates: Vec<CertificateConfig>) -> Result<Vec<String>, CertMgtError> {
+    let filtered = filter_certificates_simple(certificates, "has_private_key==false")?;
     Ok(filtered
         .into_iter()
         .map(|config| config.common_name)
@@ -278,37 +273,34 @@ pub fn list_certificates_without_keys(json_path: &Path) -> Result<Vec<String>, C
 }
 
 pub fn find_certificates_by_common_name(
-    json_path: &Path,
+    certificates: Vec<CertificateConfig>,
     common_name: &str,
 ) -> Result<Vec<CertificateConfig>, CertMgtError> {
-    filter_certificates_simple(json_path, &format!("common_name~{}", common_name))
+    filter_certificates_simple(certificates, &format!("common_name~{}", common_name))
 }
 
 pub fn find_certificates_by_organization(
-    json_path: &Path,
+    certificates: Vec<CertificateConfig>,
     organization: &str,
 ) -> Result<Vec<CertificateConfig>, CertMgtError> {
-    filter_certificates_simple(json_path, &format!("organization~{}", organization))
+    filter_certificates_simple(certificates, &format!("organization~{}", organization))
 }
 
 pub fn find_expiring_certificates(
-    json_path: &Path,
+    certificates: Vec<CertificateConfig>,
     days_ahead: i64,
 ) -> Result<Vec<CertificateConfig>, CertMgtError> {
     let threshold = chrono::Utc::now().timestamp() + (days_ahead * 24 * 60 * 60);
-    let configs = match json_path.extension().and_then(|ext| ext.to_str()) {
-        Some("gz") => load_certificates_from_json_compressed(json_path)?,
-        _ => load_certificates_from_json(json_path)?,
-    };
 
-    Ok(configs
+
+    Ok(certificates
         .into_iter()
         .filter(|config| config.not_after <= threshold && config.not_after > 0)
         .collect())
 }
 
-pub fn find_ca_certificates(json_path: &Path) -> Result<Vec<CertificateConfig>, CertMgtError> {
-    filter_certificates_simple(json_path, "is_ca==true")
+pub fn find_ca_certificates(certificates: Vec<CertificateConfig>) -> Result<Vec<CertificateConfig>, CertMgtError> {
+    filter_certificates_simple(certificates, "is_ca==true")
 }
 
 #[cfg(test)]
