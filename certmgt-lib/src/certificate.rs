@@ -1,6 +1,6 @@
 use crate::detection::detect_cert_type;
 use crate::types::{CaConfig, CertData, CertDataType, CertificateConfig, ServerCertConfig};
-use crate::utils::asn1_time_to_timestamp;
+use crate::utils::{asn1_time_to_timestamp, generate_secure_serial_number};
 use crate::CertMgtError;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine as _;
@@ -191,11 +191,7 @@ impl CertificateConfig {
         ];
 
         // Generate key pair
-        let key_pair = if config.key_size == 4096 {
-            KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
-        } else {
-            KeyPair::generate()
-        }.map_err(|e| CertMgtError::KeyGenerationError(e.to_string()))?;
+        let key_pair = KeyPair::generate()?;
 
         // Generate self-signed CA certificate
         let ca_cert = ca_params.self_signed(&key_pair)
@@ -228,7 +224,6 @@ impl CertificateConfig {
     pub fn sign_certificate(
         &self,
         config: &ServerCertConfig,
-        next_serial: u64
     ) -> Result<CertificateConfig, CertMgtError> {
         // Verify this is a CA certificate
         if !self.is_ca {
@@ -278,15 +273,13 @@ impl CertificateConfig {
         }
 
         // Generate key pair for the new certificate
-        let key_pair = if config.key_size == 4096 {
-            KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
-        } else {
-            KeyPair::generate()
-        }.map_err(|e| CertMgtError::KeyGenerationError(e.to_string()))?;
+        let key_pair = KeyPair::generate()?;
 
         // Set serial number
-        cert_params.serial_number = Some(next_serial.into());
-
+        let number = generate_secure_serial_number()?;
+        let serial_number = number.clone().to_string();
+        cert_params.serial_number = Some(number);
+        let number = serial_number.clone().to_string();
         // Sign the certificate
         let certificate = cert_params.signed_by(&key_pair, &issuer)
             .map_err(|e| CertMgtError::CertificateSigningError(e.to_string()))?;
@@ -310,7 +303,7 @@ impl CertificateConfig {
                 cert: cert_pem,
                 key: Some(key_pem)
             },
-            serial_number: next_serial.to_string(),
+            serial_number,
         })
     }
 

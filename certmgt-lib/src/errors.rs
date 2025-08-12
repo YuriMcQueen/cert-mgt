@@ -1,3 +1,4 @@
+use rcgen::SerialNumber;
 use thiserror::Error;
 
 // Your existing error type
@@ -26,7 +27,7 @@ pub enum CertMgtError {
 
     #[error("Key generation failed: {0}")]
     KeyGenerationError(String),
-
+    
     #[error("Error extracting key: {0}")]
     KeyExtractionError(String),
 

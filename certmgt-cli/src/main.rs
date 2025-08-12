@@ -7,7 +7,7 @@ use certmgt_lib::{
     CertificateConfig
 };
 use crate::json::*;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use serde::de::Error;
 use std::path::{Path, PathBuf};
 use certmgt_lib::types::{CaConfig, ServerCertConfig};
@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
                         eprintln!("P12 file {} requires a password.", p.display());
                         eprint!("Enter password: ");
                         use std::io::{self, Write};
-                        io::stdout().flush().unwrap();
+                        io::stdout().flush()?;
 
                         let password = rpassword::read_password()?;
                         match CertificateConfig::read_from_path(
@@ -366,7 +366,7 @@ fn main() -> anyhow::Result<()> {
                 if key_content.contains("ENCRYPTED") {
                     eprint!("Private key appears to be encrypted. Enter password: ");
                     use std::io::{self, Write};
-                    io::stdout().flush().unwrap();
+                    io::stdout().flush()?;
                     Some(rpassword::read_password()?)
                 } else {
                     None
@@ -405,10 +405,10 @@ fn main() -> anyhow::Result<()> {
                     );
                     eprint!("Do you want to replace it? (y/N): ");
                     use std::io::{self, Write};
-                    io::stdout().flush().unwrap();
+                    io::stdout().flush()?;
 
                     let mut response = String::new();
-                    io::stdin().read_line(&mut response).unwrap();
+                    io::stdin().read_line(&mut response)?;
                     response.trim().to_lowercase().starts_with('y')
                 }
                 Err(e) => {
@@ -506,7 +506,7 @@ fn main() -> anyhow::Result<()> {
             };
             let ca = CertificateConfig::new_ca(new_ca_config)?;
             println!("{:?}", ca.cert_data);
-            let cert = CertificateConfig::sign_certificate(&ca, &new_cert_config, 1)?;
+            let cert = CertificateConfig::sign_certificate(&ca, &new_cert_config)?;
             save_certificates_to_json(vec![ca, cert], &database)?;
 
         }
@@ -522,7 +522,7 @@ fn is_database_file(path: &PathBuf) -> bool {
         Some("gz") => {
             // Check if it's .json.gz
             path.file_stem()
-                .and_then(|stem| std::path::Path::new(stem).extension())
+                .and_then(|stem| Path::new(stem).extension())
                 .and_then(|ext| ext.to_str())
                 == Some("json")
         }
@@ -614,6 +614,7 @@ fn display_detailed(configs: &[CertificateConfig], show_content: bool) {
         println!("{}", "=".repeat(60));
 
         println!("Subject Information:");
+        println!("  Serial Number: {}", config.serial_number);
         println!("  Common Name: {}", config.common_name);
         println!("  Organization: {}", config.organization);
         println!("  Organizational Unit: {}", config.organizational_unit);
@@ -729,7 +730,8 @@ fn display_json(configs: &[CertificateConfig], show_content: bool) -> anyhow::Re
             "not_before": config.not_before,
             "not_after": config.not_after,
             "has_private_key": config.has_private_key(),
-            "certificate_type": cert_type_info
+            "certificate_type": cert_type_info,
+            "serial_number": config.serial_number,
             })
         })
         .collect();
