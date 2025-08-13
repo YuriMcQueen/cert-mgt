@@ -79,53 +79,6 @@ pub fn load_certificates_from_json_compressed(
     Ok(db.certificates)
 }
 
-// JSONL (JSON Lines) variant for streaming/appending
-pub fn save_certificates_to_jsonl(
-    configs: Vec<CertificateConfig>,
-    path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Write;
-
-    let mut file = std::fs::File::create(path)?;
-    for config in configs {
-        let line = serde_json::to_string(&config)?;
-        writeln!(file, "{}", line)?;
-    }
-    Ok(())
-}
-
-pub fn load_certificates_from_jsonl(
-    path: &Path,
-) -> Result<Vec<CertificateConfig>, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let mut configs = Vec::new();
-
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let config: CertificateConfig = serde_json::from_str(line)?;
-        configs.push(config);
-    }
-
-    Ok(configs)
-}
-
-// Append a single certificate to JSONL file
-pub fn append_certificate_to_jsonl(
-    config: CertificateConfig,
-    path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-
-    let line = serde_json::to_string(&config)?;
-    writeln!(file, "{}", line)?;
-    Ok(())
-}
-
 /// Export certificate in its original format with optional filtering
 pub fn export_certificate(
     config: &CertificateConfig,

@@ -22,11 +22,11 @@ pub enum Commands {
         organization: String,
         #[arg(long, help = "Common name", default_value = "example.com")]
         common_name: String,
-        #[arg(long, help = "Certificate key size", default_value = "4096")]
+        #[arg(long, help = "Certificate key size", default_value = "2048")]
         key_size: u32,
         #[arg(long, help = "Common name", default_value = "example.com")]
         alt_names: Vec<String>,
-        #[arg(long, help = "CA key size", default_value = "4096")]
+        #[arg(long, help = "CA key size", default_value = "2048")]
         ca_key_size: u32,
         #[arg(long, help = "CA expiration in days", default_value = "365")]
         ca_validity_days: u32,

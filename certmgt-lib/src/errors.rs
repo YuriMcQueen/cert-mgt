@@ -1,7 +1,5 @@
-use rcgen::SerialNumber;
 use thiserror::Error;
 
-// Your existing error type
 #[derive(Debug, Error)]
 pub enum CertMgtError {
     #[error("Certificate with common name '{0}' not found")]
@@ -64,13 +62,14 @@ pub enum CertMgtError {
     #[error("JSON error")]
     JsonError(#[from] serde_json::Error),
 
-    #[error("Rcgen error")]
-    RcGenError(#[from] rcgen::Error),
-
     #[error("AddrParse error")]
     AddrParseError(#[from] std::net::AddrParseError),
 
     // Add this if you need to wrap other error types
     #[error("Other error: {0}")]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("Error: {0}")]
+    SerialNumberError(#[from]  der::Error),
+
 }

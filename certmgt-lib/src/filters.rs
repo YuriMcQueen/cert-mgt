@@ -1,7 +1,6 @@
 use crate::{
     CertData, CertMgtError, CertificateConfig,
 };
-use std::path::Path;
 use std::str::FromStr;
 
 // Filter operations
