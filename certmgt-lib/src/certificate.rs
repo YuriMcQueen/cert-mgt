@@ -6,8 +6,8 @@ use base64::prelude::BASE64_STANDARD;
 use base64::Engine as _;
 
 use std::error::Error;
-use p12::PFX;
-use pem::{parse, parse_many};
+use p12_keystore::{KeyStore, KeyStoreEntry};
+use pem::{parse, parse_many, Pem};
 use x509_parser::asn1_rs::{FromDer, Oid};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::oid_registry;
@@ -28,33 +28,43 @@ use der::{Encode, Decode, Any};
 use spki::{SubjectPublicKeyInfo, AlgorithmIdentifier};
 use time::{OffsetDateTime, Duration};
 use std::net::IpAddr;
+use std::path::Path;
 use const_oid::db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION;
 use der::asn1::Null;
+use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPublicKey};
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, DecodePrivateKey};
 use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
 use x509_cert::attr::AttributeTypeAndValue;
 use x509_cert::ext::pkix::KeyUsages;
+use x509_parser::pem::parse_x509_pem;
 
 impl CertificateConfig {
-    pub fn read_from_path(path: &str, password: Option<&str>) -> Result<Self, Box<dyn Error>> {
-        let bytes = std::fs::read(path)?;
-        let cert_type = detect_cert_type(&bytes)?;
+    pub fn read_from_path(path: &str, password: Option<&str>) -> Result<Self, CertMgtError> {
+        let bytes = std::fs::read(path).map_err(CertMgtError::IoError)?;
+        let cert_type = detect_cert_type(&bytes)
+            .map_err(|e| CertMgtError::UnsupportedCertFormat(format!("{}: {}", path, e)))?;
 
         match cert_type {
             CertDataType::PemCertAndKey => {
                 let content = std::str::from_utf8(&bytes)?;
                 Self::parse_pem_cert_and_key(content)
+                    .map_err(|e| CertMgtError::InvalidConfiguration(format!("{}: {}", path, e)))
             }
             CertDataType::PemOnlyCert => {
                 let content = std::str::from_utf8(&bytes)?;
                 Self::parse_pem_cert_only(content)
+                    .map_err(|e| CertMgtError::InvalidConfiguration(format!("{}: {}", path, e)))
             }
             CertDataType::PemOnlyKey => {
-                Err("PEM file contains only private key, certificate missing".into())
+                Err(CertMgtError::InvalidPrivateKey(format!(
+                    "PEM file {} contains only private key, no certificate",
+                    path
+                )))
             }
             CertDataType::P12 { as_base64 } => {
                 Self::parse_p12(&bytes, password, as_base64)
+                    .map_err(|e| CertMgtError::InvalidConfiguration(format!("{}: {}", path, e)))
             }
         }
     }
@@ -131,41 +141,60 @@ impl CertificateConfig {
             bytes.to_vec()
         };
 
-        let pfx = PFX::parse(&raw)?;
         let pwd = password.unwrap_or("");
 
-        if !pfx.verify_mac(pwd) {
-            return Err("PFX MAC verification failed".into());
-        }
+        let keystore = KeyStore::from_pkcs12(&raw, pwd)?;
+
         // Build cert_data to store entire original P12 content
         let cert_data = CertData::P12 {
             data: if as_base64 {
                 String::from_utf8(bytes.to_vec())?
             } else {
-                base64::encode(&raw)
+                BASE64_STANDARD.encode(&raw)
             },
             password: pwd.to_string(),
             as_base64,
         };
-        let certs = pfx.cert_bags(pwd)?;
+
+        // Get all aliases and find the first certificate entry
         let mut leaf_cert: Option<X509Certificate> = None;
 
-        // Iterate through all certificates
-        for der in &certs {
-            let (_, cert) = X509Certificate::from_der(der)?;
-            // Check if it's a leaf cert (subject != issuer typically)
-            if cert.subject() != cert.issuer() {
-                leaf_cert = Some(cert.to_owned());
-                break;
+        for alias in keystore.entries() {
+            if let Some(entry) = keystore.entry(&alias.0) {
+                match entry {
+                    KeyStoreEntry::PrivateKeyChain(private_key_chain) => {
+                        // Get the first certificate from the chain (leaf certificate)
+                        if let Some(cert) = private_key_chain.chain().first() {
+                            let cert_der = cert.as_der();
+                            let (_, parsed_cert) = X509Certificate::from_der(cert_der)?;
+
+                            // Check if it's a leaf cert (subject != issuer typically)
+                            if parsed_cert.subject() != parsed_cert.issuer() {
+                                leaf_cert = Some(parsed_cert);
+                                break;
+                            }
+                        }
+                    },
+                    KeyStoreEntry::Certificate(cert) => {
+                        // This is a standalone certificate
+                        let cert_der = cert.as_der();
+                        let (_, parsed_cert) = X509Certificate::from_der(cert_der)?;
+
+                        // Check if it's a leaf cert
+                        if parsed_cert.subject() != parsed_cert.issuer() {
+                            leaf_cert = Some(parsed_cert);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
-        let cert = leaf_cert.ok_or("No leaf certificate found in PFX")?;
+        let cert = leaf_cert.ok_or("No leaf certificate found in PKCS#12")?;
         let cert = get_cert_info(cert, cert_data)?;
-
         Ok(cert)
     }
-
     pub fn get_cert_pem(&self) -> Option<&str> {
         match &self.cert_data {
             CertData::Pem { cert, .. } => Some(cert),
@@ -506,6 +535,69 @@ impl CertificateConfig {
             _ => Err(CertMgtError::InvalidConfiguration("No private key available".to_string())),
         }
     }
+    pub fn matches_key_file(&self, key_path: &Path) -> bool {
+        // Extract cert public key
+        let cert_pubkey = match &self.cert_data {
+            CertData::Pem { cert, .. } => {
+                let (_, pem) = parse_x509_pem(cert.as_bytes()).unwrap();
+                let cert = pem.parse_x509().unwrap();
+                Some(cert.subject_pki.subject_public_key.data.to_vec())
+            }
+            _ => return false,
+        };
+
+        // Extract key public key
+        let key_bytes = match std::fs::read(key_path) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let key_str = match std::str::from_utf8(&key_bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let key_pubkey = match pem::parse(key_str.as_bytes()) {
+            Ok(pem) => {
+                // Use `pem.contents()` instead of `.contents`
+                match RsaPrivateKey::from_pkcs1_der(pem.contents()) {
+                    Ok(rsa) => match rsa.to_public_key().to_pkcs1_der() {
+                        Ok(der) => Some(der.as_bytes().to_vec()),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        };
+
+        cert_pubkey.is_some() && cert_pubkey == key_pubkey
+    }
+    /// Returns `true` if the given PEM key file matches the certificate.
+    pub fn attach_key_from_file(
+        &mut self,
+        key_path: &Path,
+        password: Option<&str>,
+    ) -> Result<(), CertMgtError> {
+        let bytes = std::fs::read(key_path)?;
+        let key_str = std::str::from_utf8(&bytes)?;
+
+        match &mut self.cert_data {
+            CertData::Pem { cert, key: existing_key } => {
+                if existing_key.is_some() {
+                    eprintln!("Certificate already has a key attached. Overwriting.");
+                }
+                *existing_key = Some(key_str.to_string());
+            }
+            CertData::P12 { .. } => {
+                return Err(CertMgtError::InvalidPrivateKey(
+                    "Cannot attach PEM key to P12 certificate".into(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
 
     fn extract_ca_private_key(&self) -> Result<RsaPrivateKey, CertMgtError> {
         self.extract_private_key_rsa()

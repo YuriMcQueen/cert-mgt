@@ -15,7 +15,7 @@ flate2.workspace= true
 thiserror.workspace = true
 x509-parser.workspace = true
 time = "0.3"
-p12 = "0.6"
+p12-keystore = "0.2.0"
 pem = "3.0.5"
 x509-cert = { version = "0.2", features = ["builder"] }
 der = "0.7"

@@ -62,10 +62,10 @@ pub enum Commands {
         inputs: Vec<PathBuf>,
         #[arg(long, help = "Output database file (.json or .json.gz)")]
         database: PathBuf,
-        #[arg(long, help = "Append to existing database instead of overwriting")]
-        append: bool,
         #[arg(long, help = "Use compressed JSON format")]
         compressed: bool,
+        #[arg(long, help = "Overwrite duplicates")]
+        force: bool,
     },
     /// Export certificates from JSON database to individual files in their original format
     Export {
