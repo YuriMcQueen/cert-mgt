@@ -122,61 +122,76 @@ fn main() -> anyhow::Result<()> {
                     eprintln!("No certificates found in {}", p.display());
                     continue;
                 }
+                println!("Found {} certificates", discovered_files.len());
+                'outer: for file_path in discovered_files {
+                    let config = loop {
+                        match CertificateConfig::read_from_path(file_path.to_str().unwrap_or_default(), None) {
+                            Ok(config) => break config,
 
-                for file_path in discovered_files {
-                    let config = match CertificateConfig::read_from_path(file_path.to_str().unwrap(), None) {
-                        Ok(config) => config,
+                            // P12 requires password
+                            Err(e) if e.to_string().contains("requires a password") => {
+                                eprintln!("P12 file {} requires a password.", file_path.display());
+                                eprint!("Enter password: ");
+                                io::stdout().flush()?;
+                                let password = rpassword::read_password()?;
+                                match CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password)) {
+                                    Ok(config) => break config,
+                                    Err(e) => {
+                                        eprintln!("Error reading {} with password: {}", file_path.display(), e);
+                                        continue 'outer; // Continue to next file
+                                    }
+                                }
+                            },
 
-                        // P12 requires password
-                        Err(e) if e.to_string().contains("mac verify failure") => {
-                            eprintln!("P12 file {} requires a password.", file_path.display());
-                            eprint!("Enter password: ");
-                            io::stdout().flush()?;
-                            let password = rpassword::read_password()?;
-                            CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password))
-                                .unwrap_or_else(|e| {
-                                    eprintln!("Error reading {} with password: {}", file_path.display(), e);
-                                    std::process::exit(1);
-                                })
-                        },
+                            // PEM only key
+                            Err(e) if e.to_string().contains("PEM file contains only private key") => {
+                                eprintln!("Found PEM key only: {}", file_path.display());
 
-                        // PEM only key
-                        Err(e) if e.to_string().contains("PEM file contains only private key") => {
-                            eprintln!("Found PEM key only: {}", file_path.display());
+                                // Look for matching cert in same directory
+                                let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
+                                let candidates = discover_cert_files(dir);
 
-                            // Look for matching cert in same directory
-                            let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
-                            let candidates = discover_cert_files(dir);
+                                let matching_cert_path = candidates.into_iter()
+                                    .filter(|p| *p != file_path) // skip the key itself
+                                    .find(|p| {
+                                        CertificateConfig::read_from_path(p.to_str().unwrap(), None)
+                                            .map(|c| c.matches_key_file(&file_path))
+                                            .unwrap_or(false)
+                                    });
 
-                            let matching_cert_path = candidates.into_iter()
-                                .filter(|p| *p != file_path) // skip the key itself
-                                .find(|p| {
-                                    CertificateConfig::read_from_path(p.to_str().unwrap(), None)
-                                        .map(|c| c.matches_key_file(&file_path))
-                                        .unwrap_or(false)
-                                });
+                                if let Some(cert_path) = matching_cert_path {
+                                    eprintln!("Found matching certificate: {}", cert_path.display());
 
-                            if let Some(cert_path) = matching_cert_path {
-                                eprintln!("Found matching certificate: {}", cert_path.display());
+                                    // Load the certificate first
+                                    match CertificateConfig::read_from_path(cert_path.to_str().unwrap(), None) {
+                                        Ok(mut cert_config) => {
+                                            // Attach the key to the in-memory CertificateConfig
+                                            match cert_config.attach_key_from_file(&file_path, None) {
+                                                Ok(_) => break cert_config,
+                                                Err(e) => {
+                                                    eprintln!("Error attaching key: {}", e);
+                                                    continue 'outer;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Error reading certificate {}: {}", cert_path.display(), e);
+                                            continue 'outer;
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("No matching certificate found for key {}", file_path.display());
+                                    continue 'outer;
+                                }
+                            }
 
-                                // Load the certificate first
-                                let mut cert_config = CertificateConfig::read_from_path(cert_path.to_str().unwrap(), None)?;
-
-                                // Attach the key to the in-memory CertificateConfig
-                                cert_config.attach_key_from_file(&file_path, None)?; // reuse AttachKey logic
-
-                                cert_config
-                            } else {
-                                eprintln!("No matching certificate found for key {}", file_path.display());
-                                continue
+                            Err(e) => {
+                                eprintln!("Error reading {}: {}", file_path.display(), e);
+                                continue 'outer;
                             }
                         }
-
-                        Err(e) => {
-                            eprintln!("Error reading {}: {}", file_path.display(), e);
-                            std::process::exit(1);
-                        }
                     };
+
                     let fp = cert_fingerprint(&config.cert_data);
                     let common_name = config.common_name.clone();
                     if seen.contains(&fp) {
@@ -221,7 +236,6 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-
         Commands::Export {
             database,
             output_dir,

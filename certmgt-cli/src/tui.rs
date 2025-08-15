@@ -18,6 +18,8 @@ use std::{fs, io, path::Path};
 use std::path::PathBuf;
 use dirs::home_dir;
 use certmgt_lib::{CertMgtError, CertificateConfig};
+use certmgt_lib::types::{CaConfig, ServerCertConfig};
+use crate::json::save_certificates_to_json;
 use crate::load_certificates_from_database;
 
 // Configuration management
@@ -31,6 +33,7 @@ pub struct TuiConfig {
     pub recent_databases: Vec<String>,
     pub max_recent_databases: usize,
 }
+
 
 impl Default for TuiConfig {
     fn default() -> Self {
@@ -113,8 +116,90 @@ pub enum ViewMode {
     Setup,
     CertificateList,
     CertificateDetail(usize),
+    GenerateCert(CertForm),
     Help,
     Config,
+}
+#[derive(Clone, PartialEq)]
+struct CertForm {
+    validity_days: u32,
+    country: String,
+    state: String,
+    organization: String,
+    common_name: String,
+    key_size: usize,
+    alt_names: Vec<String>,
+    ca_validity_days: u32,
+    ca_key_size: usize,
+    database: String,
+    field_index: usize,
+    temp_alt_name: String,
+}
+impl CertForm {
+    pub fn default() -> Self {
+        Self {
+            country: "US".into(),
+            state: "CA".into(),
+            organization: "Example Org".into(),
+            common_name: "example.com".into(),
+            alt_names: vec!["www.example.com".into()],
+            key_size: 2048,
+            validity_days: 365,
+            ca_key_size: 4096,
+            ca_validity_days: 3650,
+            database: "certs.json".into(),
+            field_index: 0,
+            temp_alt_name: "".to_string(),
+        }
+    }
+
+    pub fn next_field(&mut self) {
+        self.field_index = (self.field_index + 1) % 9;
+    }
+
+    pub fn prev_field(&mut self) {
+        self.field_index = (self.field_index + 9 - 1) % 9;
+    }
+
+    pub fn add_char(&mut self, c: char) {
+        match self.field_index {
+            0 => self.country.push(c),
+            1 => self.state.push(c),
+            2 => self.organization.push(c),
+            3 => self.common_name.push(c),
+            4 => {
+                if let Some(last) = self.alt_names.last_mut() {
+                    last.push(c);
+                } else {
+                    self.alt_names.push(c.to_string());
+                }
+            }
+            5 => self.key_size = format!("{}{}", self.key_size, c).parse().unwrap_or(self.key_size),
+            6 => self.validity_days = format!("{}{}", self.validity_days, c).parse().unwrap_or(self.validity_days),
+            7 => self.ca_key_size = format!("{}{}", self.ca_key_size, c).parse().unwrap_or(self.ca_key_size),
+            8 => self.ca_validity_days = format!("{}{}", self.ca_validity_days, c).parse().unwrap_or(self.ca_validity_days),
+            _ => {}
+        }
+    }
+
+    pub fn delete_char(&mut self) {
+        match self.field_index {
+            0 => { self.country.pop(); },
+            1 => { self.state.pop(); },
+            2 => { self.organization.pop(); },
+            3 => { self.common_name.pop(); },
+            4 => {
+                if let Some(last) = self.alt_names.last_mut() {
+                    last.pop();
+                }
+            }
+            5 => self.key_size /= 10,
+            6 => self.validity_days /= 10,
+            7 => self.ca_key_size /= 10,
+            8 => self.ca_validity_days /= 10,
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -403,6 +488,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                             }
                         },
                         KeyCode::Char('c') => app.show_config(),
+                        KeyCode::Char('g') => {
+                            app.current_view = ViewMode::GenerateCert(CertForm::default());
+                        }
                         KeyCode::Char('s') => app.back_to_setup(),
                         _ => {}
                     }
@@ -415,13 +503,82 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                         _ => {}
                     }
                 },
-                ViewMode::Help => {
+                ViewMode::GenerateCert(ref mut form) => {
                     match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Esc | KeyCode::Char('h') => app.back_to_list(),
+                        KeyCode::Esc => app.current_view = ViewMode::CertificateList,
+                        KeyCode::Tab => form.next_field(),
+                        KeyCode::BackTab => form.prev_field(),
+                        KeyCode::Char(c) => form.add_char(c),
+                        KeyCode::Backspace => form.delete_char(),
+                        KeyCode::Enter => {
+                            if form.field_index == 10 {
+                                if !form.temp_alt_name.is_empty() {
+                                    form.alt_names.push(form.temp_alt_name.clone());
+                                    form.temp_alt_name.clear();
+                                } else {
+                                    let new_ca_config = CaConfig {
+                                        country: form.country.clone(),
+                                        state: form.state.clone(),
+                                        organization: form.organization.clone(),
+                                        common_name: form.common_name.clone(),
+                                        key_size: form.ca_key_size as u32,
+                                        validity_days: form.ca_validity_days,
+                                    };
+                                    let new_cert_config = ServerCertConfig {
+                                        country: form.country.clone(),
+                                        state: form.state.clone(),
+                                        organization: form.organization.clone(),
+                                        common_name: form.common_name.clone(),
+                                        alt_names: form.alt_names.clone(),
+                                        key_size: form.key_size,
+                                        validity_days: form.validity_days,
+                                    };
+                                    match CertificateConfig::new_ca(new_ca_config) {
+                                        Ok(ca) => match CertificateConfig::sign_certificate(&ca, &new_cert_config) {
+                                            Ok(cert) => {
+                                                if let Err(e) = save_certificates_to_json(vec![ca, cert], (&form.database).as_ref()) {
+                                                    app.status_message = format!("Error saving certs: {}", e);
+                                                } else {
+                                                    app.status_message = "Certificate generated successfully".into();
+                                                }
+                                            }
+                                            Err(e) => app.status_message = format!("Error signing cert: {}", e),
+                                        },
+                                        Err(e) => app.status_message = format!("Error creating CA: {}", e),
+                                    }
+                                    app.current_view = ViewMode::CertificateList;
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {
+                            app.status_message = "Cancelled certificate generation".into();
+                            app.current_view = ViewMode::CertificateList;
+                        }
+                        KeyCode::Char(c) => {
+                            match form.field_index {
+                                1 => form.country.push(c),
+                                2 => form.state.push(c),
+                                3 => form.organization.push(c),
+                                4 => form.common_name.push(c),
+                                8 => form.database.push(c),
+                                10 => form.temp_alt_name.push(c),
+                                _ => {}
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            match form.field_index {
+                                1 => { form.country.pop(); }
+                                2 => { form.state.pop(); }
+                                3 => { form.organization.pop(); }
+                                4 => { form.common_name.pop(); }
+                                8 => { form.database.pop(); }
+                                10 => { form.temp_alt_name.pop(); }
+                                _ => {}
+                            }
+                        }
                         _ => {}
                     }
-                },
+                }
                 ViewMode::Config => {
                     match key.code {
                         KeyCode::Char('q') => return Ok(()),
@@ -430,6 +587,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                         _ => {}
                     }
                 }
+                ViewMode::Help => {}
             }
         }
     }
@@ -442,6 +600,7 @@ fn ui<B: Backend>(f: &mut Frame, app: &mut App) {
         ViewMode::CertificateDetail(index) => draw_certificate_detail::<B>(f, app, index),
         ViewMode::Help => draw_help::<B>(f, app),
         ViewMode::Config => draw_config_screen::<B>(f, app),
+        ViewMode::GenerateCert(ref form) => draw_cert_form::<B>(f, form),
     }
 }
 
@@ -786,6 +945,32 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
     f.render_widget(help, chunks[2]);
 }
 
+fn draw_cert_form<B: Backend>(f: &mut Frame, form: &CertForm) {
+    let fields = vec![
+        format!("Validity Days: {}", form.validity_days),
+        format!("Country: {}", form.country),
+        format!("State: {}", form.state),
+        format!("Organization: {}", form.organization),
+        format!("Common Name: {}", form.common_name),
+        format!("Key Size: {}", form.key_size),
+        format!("CA Validity Days: {}", form.ca_validity_days),
+        format!("CA Key Size: {}", form.ca_key_size),
+        format!("Database File: {}", form.database),
+        format!("Alt Names: {:?}", form.alt_names),
+        format!("Temp Alt Name (Enter to add): {}", form.temp_alt_name),
+    ];
+
+    // Simple rendering: highlight active field
+    for (i, field) in fields.iter().enumerate() {
+        let style = if i == form.field_index {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let para = Paragraph::new(field.clone()).style(style);
+        f.render_widget(para, Rect::new(2, (i+2) as u16, 70, 1));
+    }
+}
 fn draw_help<B: Backend>(f: &mut Frame, app: &App) {
     let help_text = "Certificate Management TUI - Help\n\n\
         SETUP SCREEN:\n\

@@ -132,7 +132,7 @@ impl CertificateConfig {
         bytes: &[u8],
         password: Option<&str>,
         as_base64: bool,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<CertificateConfig, Box<dyn std::error::Error>> {
         // Decode base64 if necessary
         let raw = if as_base64 {
             let s = std::str::from_utf8(bytes)?;
@@ -142,45 +142,18 @@ impl CertificateConfig {
             bytes.to_vec()
         };
 
-        let pwd = password.unwrap_or("");
+        // If no password provided, signal that CLI should prompt
+        let pwd = if let Some(p) = password {
+            p
+        } else {
+            return Err("P12 requires a password".into());
+        };
 
-        // Debug password handling
-        println!("Password provided: {}", if pwd.is_empty() { "empty" } else { "non-empty" });
-        println!("PKCS#12 file size: {} bytes", raw.len());
+        // Try to load the PKCS#12 keystore
+        let keystore = KeyStore::from_pkcs12(&raw, pwd)
+            .map_err(|e| format!("Failed to load PKCS#12 with provided password: {}", e))?;
 
-        // Try different password encodings
-        let password_attempts = [
-            pwd.as_bytes(),                    // UTF-8 bytes
-            &[],                              // Empty password
-            if pwd.is_empty() { &[] } else { pwd.as_bytes() }, // Handle empty vs null
-        ];
-
-        let mut keystore = None;
-        let mut last_error = None;
-
-        for (i, pwd_bytes) in password_attempts.iter().enumerate() {
-            println!("Trying password attempt {}: {} bytes", i + 1, pwd_bytes.len());
-
-            match KeyStore::from_pkcs12(&raw, pwd) {
-                Ok(ks) => {
-                    println!("Successfully loaded keystore with password attempt {}", i + 1);
-                    keystore = Some(ks);
-                    break;
-                },
-                Err(e) => {
-                    println!("Password attempt {} failed: {}", i + 1, e);
-                    last_error = Some(e);
-                    continue;
-                }
-            }
-        }
-
-        let keystore = keystore.ok_or_else(|| {
-            format!("Failed to load PKCS#12 with any password attempt. Last error: {}",
-                    last_error.map(|e| e.to_string()).unwrap_or("Unknown".to_string()))
-        })?;
-
-        // Build cert_data to store entire original P12 content
+        // Build CertData to store the entire original P12 content
         let cert_data = CertData::P12 {
             data: if as_base64 {
                 String::from_utf8(bytes.to_vec())?
@@ -191,100 +164,59 @@ impl CertificateConfig {
             as_base64,
         };
 
-        // Get all aliases and find certificates with better detection logic
+        // Collect all certificates and find the leaf certificate
         let mut leaf_cert: Option<X509Certificate> = None;
         let mut all_certs: Vec<X509Certificate> = Vec::new();
 
         println!("Found {} aliases in keystore", keystore.entries().count());
 
         for alias in keystore.entries() {
-            println!("Processing alias: {:?}", alias);
-
             if let Some(entry) = keystore.entry(&alias.0) {
                 match entry {
                     KeyStoreEntry::PrivateKeyChain(private_key_chain) => {
-                        println!("Found private key chain with {} certificates", private_key_chain.chain().len());
-
-                        // In a private key chain, the first certificate is typically the leaf/entity certificate
+                        // First certificate is usually the leaf
                         if let Some(cert) = private_key_chain.chain().first() {
                             let cert_der = cert.as_der();
                             let (_, parsed_cert) = X509Certificate::from_der(cert_der)?;
-                            println!("Certificate subject: {}", parsed_cert.subject());
-                            println!("Certificate issuer: {}", parsed_cert.issuer());
-
-                            // For private key chains, the first cert is usually the leaf
                             if leaf_cert.is_none() {
                                 leaf_cert = Some(parsed_cert.clone());
-                                println!("Selected as leaf certificate from private key chain");
                             }
                             all_certs.push(parsed_cert);
                         }
 
-                        // Also collect any additional certificates in the chain
-                        for (i, cert) in private_key_chain.chain().iter().enumerate().skip(1) {
+                        // Collect remaining chain certificates
+                        for cert in private_key_chain.chain().iter().skip(1) {
                             let cert_der = cert.as_der();
                             let (_, parsed_cert) = X509Certificate::from_der(cert_der)?;
-                            println!("Chain certificate {}: {}", i, parsed_cert.subject());
                             all_certs.push(parsed_cert);
                         }
                     },
                     KeyStoreEntry::Certificate(cert) => {
-                        println!("Found standalone certificate");
                         let cert_der = cert.as_der();
                         let (_, parsed_cert) = X509Certificate::from_der(cert_der)?;
-                        println!("Certificate subject: {}", parsed_cert.subject());
-                        println!("Certificate issuer: {}", parsed_cert.issuer());
-
                         all_certs.push(parsed_cert.clone());
 
-                        // If we don't have a leaf cert yet and this looks like a leaf cert
                         if leaf_cert.is_none() && parsed_cert.subject() != parsed_cert.issuer() {
                             leaf_cert = Some(parsed_cert);
-                            println!("Selected as leaf certificate (standalone)");
                         }
-                    }
+                    },
                     _ => {}
                 }
             }
         }
 
-        // If we still don't have a leaf certificate, try alternative strategies
+        // Fallback if no clear leaf certificate
         if leaf_cert.is_none() && !all_certs.is_empty() {
-            println!("No clear leaf certificate found, trying alternative strategies...");
-
-            // Strategy 1: Look for certificate with the longest subject DN (often the leaf)
             let longest_subject_cert = all_certs.iter()
                 .max_by_key(|cert| cert.subject().to_string().len());
-
-            if let Some(cert) = longest_subject_cert {
-                println!("Selecting certificate with longest subject DN as leaf");
-                leaf_cert = Some(cert.clone());
-            } else {
-                // Strategy 2: Just take the first certificate
-                println!("Using first available certificate as leaf");
-                leaf_cert = all_certs.first().cloned();
-            }
-        }
-
-        // Final fallback: list all certificates for debugging
-        if leaf_cert.is_none() {
-            println!("Available certificates in PKCS#12:");
-            for (i, cert) in all_certs.iter().enumerate() {
-                println!("  {}: Subject: {}", i, cert.subject());
-                println!("      Issuer: {}", cert.issuer());
-                println!("      Self-signed: {}", cert.subject() == cert.issuer());
-            }
-
-            if !all_certs.is_empty() {
-                println!("Using first certificate as fallback");
-                leaf_cert = all_certs.first().cloned();
-            }
+            leaf_cert = longest_subject_cert.cloned().or_else(|| all_certs.first().cloned());
         }
 
         let cert = leaf_cert.ok_or("No leaf certificate found in PKCS#12")?;
         let cert = get_cert_info(cert, cert_data)?;
         Ok(cert)
     }
+
     pub fn get_cert_pem(&self) -> Option<&str> {
         match &self.cert_data {
             CertData::Pem { cert, .. } => Some(cert),
