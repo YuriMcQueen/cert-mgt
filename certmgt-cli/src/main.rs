@@ -1,8 +1,9 @@
 mod tui;
 mod cli;
 mod json;
+mod config;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::Write;
 use certmgt_lib::filters::filter_certificates;
@@ -16,9 +17,11 @@ use crate::cli::{Commands, ListType};
 use crate::tui::launch_tui;
 use walkdir::WalkDir;
 use sha2::{Digest, Sha256};
+use crate::config::{load_passwords, PasswordSourceConfig, TuiConfig};
 
 fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
+    let config = TuiConfig::load();
 
     match cli.cmd {
         Commands::Tui => {
@@ -90,9 +93,17 @@ fn main() -> anyhow::Result<()> {
             database,
             compressed,
             force,
+            password_file,
         } => {
             let mut final_configs = Vec::new();
             let mut seen = HashSet::new();
+
+            // Decide password source: CLI > config > None
+            let password_source = if let Some(ref pwfile) = password_file {
+                Some(load_passwords(pwfile)?)
+            } else {
+                config.p12_passwords.clone()
+            };
 
             // Load database if it exists (append mode by default)
             if database.exists() {
@@ -123,6 +134,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 println!("Found {} certificates", discovered_files.len());
+
                 'outer: for file_path in discovered_files {
                     let config = loop {
                         match CertificateConfig::read_from_path(file_path.to_str().unwrap_or_default(), None) {
@@ -130,29 +142,65 @@ fn main() -> anyhow::Result<()> {
 
                             // P12 requires password
                             Err(e) if e.to_string().contains("requires a password") => {
-                                eprintln!("P12 file {} requires a password.", file_path.display());
-                                eprint!("Enter password: ");
-                                io::stdout().flush()?;
-                                let password = rpassword::read_password()?;
-                                match CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password)) {
-                                    Ok(config) => break config,
-                                    Err(e) => {
-                                        eprintln!("Error reading {} with password: {}", file_path.display(), e);
-                                        continue 'outer; // Continue to next file
+                                let fname = file_path.file_name()
+                                    .and_then(|f| f.to_str())
+                                    .unwrap_or_default();
+
+                                let mut tried = false;
+
+                                if let Some(ref source) = password_source {
+                                    match source {
+                                        PasswordSourceConfig::Map(map) => {
+                                            if let Some(pw) = map.get(fname) {
+                                                tried = true;
+                                                if let Ok(config) = CertificateConfig::read_from_path(
+                                                    file_path.to_str().unwrap(),
+                                                    Some(pw),
+                                                ) {
+                                                    break config;
+                                                }
+                                            }
+                                        }
+                                        PasswordSourceConfig::List(list) => {
+                                            tried = true;
+                                            if let Some(config) = list.iter()
+                                                .find_map(|pw| CertificateConfig::read_from_path(
+                                                    file_path.to_str().unwrap(),
+                                                    Some(pw),
+                                                ).ok())
+                                            {
+                                                break config;
+                                            }
+                                        }
                                     }
                                 }
-                            },
+
+                                // If no provided password worked, ask interactively
+                                if !tried {
+                                    eprintln!("P12 file {} requires a password.", file_path.display());
+                                    eprint!("Enter password: ");
+                                    io::stdout().flush()?;
+                                    let password = rpassword::read_password()?;
+                                    match CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password)) {
+                                        Ok(config) => break config,
+                                        Err(e) => {
+                                            eprintln!("Error reading {} with password: {}", file_path.display(), e);
+                                            continue 'outer;
+                                        }
+                                    }
+                                } else {
+                                    continue 'outer;
+                                }
+                            }
 
                             // PEM only key
                             Err(e) if e.to_string().contains("PEM file contains only private key") => {
                                 eprintln!("Found PEM key only: {}", file_path.display());
-
-                                // Look for matching cert in same directory
                                 let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
                                 let candidates = discover_cert_files(dir);
 
                                 let matching_cert_path = candidates.into_iter()
-                                    .filter(|p| *p != file_path) // skip the key itself
+                                    .filter(|p| *p != file_path)
                                     .find(|p| {
                                         CertificateConfig::read_from_path(p.to_str().unwrap(), None)
                                             .map(|c| c.matches_key_file(&file_path))
@@ -162,10 +210,8 @@ fn main() -> anyhow::Result<()> {
                                 if let Some(cert_path) = matching_cert_path {
                                     eprintln!("Found matching certificate: {}", cert_path.display());
 
-                                    // Load the certificate first
                                     match CertificateConfig::read_from_path(cert_path.to_str().unwrap(), None) {
                                         Ok(mut cert_config) => {
-                                            // Attach the key to the in-memory CertificateConfig
                                             match cert_config.attach_key_from_file(&file_path, None) {
                                                 Ok(_) => break cert_config,
                                                 Err(e) => {
@@ -198,7 +244,6 @@ fn main() -> anyhow::Result<()> {
                         if force {
                             println!("Overriding duplicate: {}", common_name);
                             overridden_count += 1;
-                            // We replace the existing version in final_configs
                             final_configs.retain(|c| cert_fingerprint(&c.cert_data) != fp);
                         } else {
                             println!("Skipping duplicate: {}", common_name);
@@ -236,6 +281,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
         Commands::Export {
             database,
             output_dir,
@@ -1004,3 +1050,4 @@ fn cert_fingerprint(cert_data: &CertData) -> String {
         }
     }
 }
+

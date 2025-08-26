@@ -66,6 +66,8 @@ pub enum Commands {
         compressed: bool,
         #[arg(long, help = "Overwrite duplicates")]
         force: bool,
+        #[arg(long, help = "path to p12 passwords file")]
+        password_file: Option<PathBuf>,
     },
     /// Export certificates from JSON database to individual files in their original format
     Export {

@@ -13,91 +13,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
-use serde::{Deserialize, Serialize};
 use std::{fs, io, path::Path};
 use std::path::PathBuf;
-use crossterm::event::KeyModifiers;
-use dirs::home_dir;
+
 use ratatui::layout::Margin;
 use certmgt_lib::{CertMgtError, CertificateConfig};
 use certmgt_lib::types::{CaConfig, ServerCertConfig};
+use crate::config::TuiConfig;
 use crate::json::save_certificates_to_json;
 use crate::load_certificates_from_database;
-
-// Configuration management
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct TuiConfig {
-    pub default_database_path: Option<String>,
-    pub auto_load_default: bool,
-    pub color_theme: String,
-    pub show_expired_warning: bool,
-    pub expiry_warning_days: i64,
-    pub recent_databases: Vec<String>,
-    pub max_recent_databases: usize,
-}
-
-
-impl Default for TuiConfig {
-    fn default() -> Self {
-        Self {
-            default_database_path: None,
-            auto_load_default: true,
-            color_theme: "default".to_string(),
-            show_expired_warning: true,
-            expiry_warning_days: 30,
-            recent_databases: Vec::new(),
-            max_recent_databases: 5,
-        }
-    }
-}
-
-impl TuiConfig {
-    pub fn load() -> Self {
-        if let Some(config_path) = Self::config_file_path() {
-            if config_path.exists() {
-                match fs::read_to_string(&config_path) {
-                    Ok(content) => {
-                        match toml::from_str(&content) {
-                            Ok(config) => return config,
-                            Err(e) => eprintln!("Warning: Failed to parse config file: {}", e),
-                        }
-                    }
-                    Err(e) => eprintln!("Warning: Failed to read config file: {}", e),
-                }
-            }
-        }
-        Self::default()
-    }
-
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(config_path) = Self::config_file_path() {
-            if let Some(parent) = config_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let content = toml::to_string_pretty(self)?;
-            fs::write(config_path, content)?;
-        }
-        Ok(())
-    }
-
-    pub fn config_file_path() -> Option<PathBuf> {
-        home_dir().map(|mut path| {
-            path.push(".config");
-            path.push("certmgt");
-            path.push("tui-config.toml");
-            path
-        })
-    }
-
-    pub fn add_recent_database(&mut self, path: &str) {
-        // Remove if already exists
-        self.recent_databases.retain(|p| p != path);
-        // Add to front
-        self.recent_databases.insert(0, path.to_string());
-        // Keep only max_recent_databases
-        self.recent_databases.truncate(self.max_recent_databases);
-    }
-}
 
 // Enhanced App struct with configuration and setup screen
 pub struct App {
@@ -926,7 +850,7 @@ fn draw_certificate_list<B: Backend>(f: &mut Frame, app: &mut App) {
             let expires_in_days = (cert.not_after - chrono::Utc::now().timestamp()) / 86400;
             let status_color = if expires_in_days < 0 {
                 Color::Red
-            } else if expires_in_days < app.config.expiry_warning_days {
+            } else if expires_in_days < app.config.expiry_warning_days as i64 {
                 Color::Yellow
             } else {
                 Color::Green
@@ -1025,7 +949,7 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
 
     let status = if expires_in_days < 0 {
         format!("❌ EXPIRED ({} days ago)", -expires_in_days)
-    } else if expires_in_days < app.config.expiry_warning_days {
+    } else if expires_in_days < app.config.expiry_warning_days as i64 {
         format!("⚠️  EXPIRING SOON ({} days)", expires_in_days)
     } else {
         format!("✅ VALID ({} days)", expires_in_days)
