@@ -27,14 +27,18 @@ build:
     - if: $CI_COMMIT_TAG == null
 
 build-release:
-  stage: build
-  image: rust:latest
+  # stage: build
+  # image: rust:latest
   <<: *rust_cache
-  before_script:
-    - rustup target add x86_64-unknown-linux-musl
-    - apt-get update && apt-get install -y gcc-x86-64-linux-gnu musl-tools gcc-multilib
+  # before_script:
+  #   - rustup target add x86_64-unknown-linux-musl
+  #   - apt-get update && apt-get install -y gcc-x86-64-linux-gnu musl-tools gcc-multilib
+  # script:
+  image: rustembedded/cross:x86_64-unknown-linux-musl
+  stage: build
   script:
-    - cargo build --release --target x86_64-unknown-linux-musl --verbose
+    - cargo install cross --git https://github.com/cross-rs/cross
+    - cross build --release --target x86_64-unknown-linux-musl
     - strip target/x86_64-unknown-linux-musl/release/$CI_PROJECT_NAME || true
     - mkdir -p artifacts/
     - cp target/x86_64-unknown-linux-musl/release/$CI_PROJECT_NAME artifacts/
