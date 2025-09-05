@@ -1,4 +1,3 @@
-
 stages:
   - build
   - release
@@ -6,10 +5,9 @@ stages:
 variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
 
-# Cache Rust dependencies for faster builds
 .rust_cache: &rust_cache
   cache:
-    key: 
+    key:
       files:
         - Cargo.lock
     paths:
@@ -27,29 +25,29 @@ build:
     - if: $CI_COMMIT_TAG == null
 
 build-release:
-  # stage: build
-  # image: rust:latest
-  <<: *rust_cache
-  # before_script:
-  #   - rustup target add x86_64-unknown-linux-musl
-  #   - apt-get update && apt-get install -y gcc-x86-64-linux-gnu musl-tools gcc-multilib
-  # script:
-  image: rustembedded/cross:x86_64-unknown-linux-musl
   stage: build
+  image: docker:24
+  services:
+    - docker:dind
+  variables:
+    DOCKER_DRIVER: overlay2
+  before_script:
+    # enable QEMU for multi-arch
+    - docker run --privileged --rm tonistiigi/binfmt --install all
+    - docker buildx create --use
   script:
-    - cargo install cross --git https://github.com/cross-rs/cross
-    - cross build --release --target x86_64-unknown-linux-musl
-    - strip target/x86_64-unknown-linux-musl/release/$CI_PROJECT_NAME || true
-    - mkdir -p artifacts/
-    - cp target/x86_64-unknown-linux-musl/release/$CI_PROJECT_NAME artifacts/
+    - docker buildx build \
+        --platform linux/amd64 \
+        --output type=local,dest=./artifacts \
+        .
     - ls -la artifacts/
-    - file artifacts/$CI_PROJECT_NAME  
+    - file artifacts/$CI_PROJECT_NAME || true
   artifacts:
     paths:
       - artifacts/
     expire_in: 1 week
   rules:
-    - if: $CI_COMMIT_TAG  
+    - if: $CI_COMMIT_TAG
 
 create-release:
   stage: release
