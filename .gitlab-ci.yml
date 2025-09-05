@@ -33,16 +33,11 @@ build-release:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
   before_script:
-    # wait until docker:dind responds
-    - |
-      for i in $(seq 1 30); do
-        if docker info >/dev/null 2>&1; then
-          echo "Docker is ready!"
-          break
-        fi
-        echo "Waiting for Docker..."
-        sleep 2
+    - echo "Waiting for Docker daemon..."
+    - until docker info >/dev/null 2>&1; do
+        sleep 1;
       done
+    - echo "Docker daemon is ready."
     - docker run --privileged --rm tonistiigi/binfmt --install all
     - docker buildx create --use
   script:
