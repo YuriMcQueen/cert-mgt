@@ -32,7 +32,7 @@ build-release:
   <<: *rust_cache
   before_script:
     - rustup target add x86_64-unknown-linux-musl
-    - apt-get update && apt-get install -y gcc-x86-64-linux-gnu musl-tools gcc-multilib
+    - apt-get update && apt-get install -y gcc-x86-64-linux-gnu musl-tools musl-dev
   script:
     - cargo build --release --target x86_64-unknown-linux-musl --verbose
     - strip target/x86_64-unknown-linux-musl/release/$CI_PROJECT_NAME || true
