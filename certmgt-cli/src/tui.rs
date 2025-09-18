@@ -1,7 +1,7 @@
 // Add this to your main.rs file
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -17,11 +17,22 @@ use std::{fs, io, path::Path};
 use std::path::PathBuf;
 
 use ratatui::layout::Margin;
+use ratatui::style::palette::material::GREEN;
+use ratatui::style::palette::tailwind::SLATE;
+use ratatui::widgets::ScrollbarState;
 use certmgt_lib::{CertMgtError, CertificateConfig};
 use certmgt_lib::types::{CaConfig, ServerCertConfig};
 use crate::config::TuiConfig;
 use crate::json::save_certificates_to_json;
 use crate::load_certificates_from_database;
+
+const NORMAL_ROW_BG: Color = SLATE.c950;
+const ALT_ROW_BG_COLOR: Color = SLATE.c900;
+const SELECTED_STYLE: Style = Style::new().bg(SLATE.c800).add_modifier(Modifier::BOLD);
+const TEXT_FG_COLOR: Color = SLATE.c200;
+const COMPLETED_TEXT_FG_COLOR: Color = GREEN.c500;
+
+
 
 // Enhanced App struct with configuration and setup screen
 pub struct App {
@@ -35,6 +46,7 @@ pub struct App {
     pub input_buffer: String,
     pub input_mode: bool,
     pub setup_state: SetupState,
+    pub vertical_scroll: u16,
     pub show_generate_popup: bool,
     pub cert_form: Option<CertForm>,
 }
@@ -92,7 +104,7 @@ impl Default for CertForm {
             temp_alt_name: String::new(),
             key_size: 2048,
             validity_days: 365,
-            ca_key_size: 4096,
+            ca_key_size: 2048,
             ca_validity_days: 3650,
             database: String::new(),
             fields: Vec::new(),
@@ -163,12 +175,146 @@ impl CertForm {
             },
             FormField {
                 name: "Alt Names".to_string(),
-                value: self.temp_alt_name.clone(),
+                value: String::new(), // This should start empty for input
                 field_type: FieldType::List,
                 required: false,
                 validation_error: None,
             },
         ];
+    }
+
+    pub fn add_char(&mut self, c: char) -> String {
+        if self.field_index < self.fields.len() {
+            let field = &mut self.fields[self.field_index];
+            let old_value = field.value.clone();
+
+            match field.field_type {
+                FieldType::Number => {
+                    if c.is_ascii_digit() {
+                        field.value.push(c);
+                        field.validation_error = None;
+                        return format!("Added '{}' to field {} ({}): '{}' -> '{}'",
+                                       c, self.field_index, field.name, old_value, field.value);
+                    } else {
+                        return format!("Rejected non-digit '{}' for number field {}", c, field.name);
+                    }
+                },
+                FieldType::Text | FieldType::List => {
+                    if c.is_ascii_graphic() || c == ' ' {
+                        field.value.push(c);
+                        field.validation_error = None;
+                        return format!("Added '{}' to field {} ({}): '{}' -> '{}'",
+                                       c, self.field_index, field.name, old_value, field.value);
+                    } else {
+                        return format!("Rejected char '{}' for text field {}", c, field.name);
+                    }
+                }
+            }
+        }
+        "add_char: invalid field_index".to_string()
+    }
+
+    pub fn delete_char(&mut self) -> String {
+        if self.field_index < self.fields.len() {
+            let field = &mut self.fields[self.field_index];
+            let old_value = field.value.clone();
+
+            if !field.value.is_empty() {
+                field.value.pop();
+                field.validation_error = None;
+                return format!("Deleted from field {} ({}): '{}' -> '{}'",
+                               self.field_index, field.name, old_value, field.value);
+            } else {
+                return format!("Field {} ({}) is already empty", self.field_index, field.name);
+            }
+        }
+        "delete_char: invalid field_index".to_string()
+    }
+
+    fn update_struct_field(&mut self, field_index: usize) {
+        if field_index >= self.fields.len() {
+            return;
+        }
+
+        let field_value = &self.fields[field_index].value;
+
+        match field_index {
+            0 => self.country = field_value.clone(),
+            1 => self.state = field_value.clone(),
+            2 => self.organization = field_value.clone(),
+            3 => self.common_name = field_value.clone(),
+            4 => {
+                if let Ok(size) = field_value.parse::<u32>() {
+                    if size >= 1024 && size <= 8192 {
+                        self.key_size = size;
+                    }
+                }
+            },
+            5 => {
+                if let Ok(days) = field_value.parse::<u32>() {
+                    if days >= 1 && days <= 36500 {
+                        self.validity_days = days;
+                    }
+                }
+            },
+            6 => {
+                if let Ok(size) = field_value.parse::<u32>() {
+                    if size >= 2048 && size <= 8192 {
+                        self.ca_key_size = size;
+                    }
+                }
+            },
+            7 => {
+                if let Ok(days) = field_value.parse::<u32>() {
+                    if days >= 1 && days <= 36500 {
+                        self.ca_validity_days = days;
+                    }
+                }
+            },
+            8 => self.temp_alt_name = field_value.clone(),
+            _ => {}
+        }
+    }
+
+    // Make sure validation works properly
+    pub fn validate(&mut self) -> bool {
+        let mut is_valid = true;
+
+        // Check required fields
+        for (index, field) in self.fields.iter_mut().enumerate() {
+            field.validation_error = None;
+
+            if field.required && field.value.trim().is_empty() {
+                field.validation_error = Some("Required field".to_string());
+                is_valid = false;
+            }
+
+            // Validate number fields
+            if field.field_type == FieldType::Number && !field.value.trim().is_empty() {
+                match field.value.parse::<u32>() {
+                    Ok(value) => {
+                        let (min_val, max_val) = match index {
+                            4 => (1024, 8192),  // Key size
+                            5 => (1, 36500),    // Validity days
+                            6 => (2048, 8192),  // CA key size
+                            7 => (1, 36500),    // CA validity days
+                            _ => continue,
+                        };
+
+                        if value < min_val || value > max_val {
+                            field.validation_error = Some(format!("Must be {}-{}", min_val, max_val));
+                            is_valid = false;
+                        }
+                    },
+                    Err(_) => {
+                        field.validation_error = Some("Invalid number".to_string());
+                        is_valid = false;
+                    }
+                }
+            }
+        }
+
+        is_valid
     }
 
     pub fn next_field(&mut self) {
@@ -180,40 +326,6 @@ impl CertForm {
             self.field_index = self.fields.len() - 1;
         } else {
             self.field_index -= 1;
-        }
-    }
-
-    pub fn add_char(&mut self, c: char) {
-        if self.field_index < self.fields.len() {
-            self.fields[self.field_index].value.push(c);
-            self.fields[self.field_index].validation_error = None;
-            self.sync_field_values();
-        }
-    }
-
-    pub fn delete_char(&mut self) {
-        if self.field_index < self.fields.len() {
-            self.fields[self.field_index].value.pop();
-            self.fields[self.field_index].validation_error = None;
-            self.sync_field_values();
-        }
-    }
-
-    fn sync_field_values(&mut self) {
-        // Sync form fields back to the main struct
-        for (i, field) in self.fields.iter().enumerate() {
-            match i {
-                0 => self.country = field.value.clone(),
-                1 => self.state = field.value.clone(),
-                2 => self.organization = field.value.clone(),
-                3 => self.common_name = field.value.clone(),
-                4 => self.key_size = field.value.parse().unwrap_or(2048),
-                5 => self.validity_days = field.value.parse().unwrap_or(365),
-                6 => self.ca_key_size = field.value.parse().unwrap_or(4096),
-                7 => self.ca_validity_days = field.value.parse().unwrap_or(3650),
-                8 => self.temp_alt_name = field.value.clone(),
-                _ => {}
-            }
         }
     }
 
@@ -234,24 +346,61 @@ impl CertForm {
         }
     }
 
-    pub fn validate(&mut self) -> bool {
-        let mut is_valid = true;
-
-        for field in &mut self.fields {
-            if field.required && field.value.trim().is_empty() {
-                field.validation_error = Some("This field is required".to_string());
-                is_valid = false;
-            } else if field.field_type == FieldType::Number {
-                if field.value.parse::<u32>().is_err() {
-                    field.validation_error = Some("Must be a valid number".to_string());
-                    is_valid = false;
-                }
-            }
+    fn sync_single_field(&mut self, field_index: usize) {
+        if field_index >= self.fields.len() {
+            return;
         }
 
-        is_valid
+        let field_value = &self.fields[field_index].value;
+
+        match field_index {
+            0 => self.country = field_value.clone(),
+            1 => self.state = field_value.clone(),
+            2 => self.organization = field_value.clone(),
+            3 => self.common_name = field_value.clone(),
+            4 => {
+                if let Ok(size) = field_value.parse::<u32>() {
+                    if size >= 1024 && size <= 8192 {
+                        self.key_size = size;
+                    }
+                }
+            },
+            5 => {
+                if let Ok(days) = field_value.parse::<u32>() {
+                    if days >= 1 && days <= 36500 {
+                        self.validity_days = days;
+                    }
+                }
+            },
+            6 => {
+                if let Ok(size) = field_value.parse::<u32>() {
+                    if size >= 2048 && size <= 8192 {
+                        self.ca_key_size = size;
+                    }
+                }
+            },
+            7 => {
+                if let Ok(days) = field_value.parse::<u32>() {
+                    if days >= 1 && days <= 36500 {
+                        self.ca_validity_days = days;
+                    }
+                }
+            },
+            8 => self.temp_alt_name = field_value.clone(),
+            _ => {}
+        }
     }
+
+    // Keep the original sync_field_values for when you need to sync all fields
+    // But call it less frequently to avoid loops
+    fn sync_all_fields(&mut self) {
+        for i in 0..self.fields.len() {
+            self.sync_single_field(i);
+        }
+    }
+
 }
+
 #[derive(Clone, PartialEq)]
 pub enum SetupState {
     Welcome,
@@ -277,6 +426,7 @@ impl App {
             input_buffer: String::new(),
             input_mode: false,
             setup_state: SetupState::Welcome,
+            vertical_scroll: 0,
             show_generate_popup: false,
             cert_form: None,
         }
@@ -425,6 +575,15 @@ impl App {
         self.current_view = ViewMode::Setup;
         self.input_mode = false;
     }
+    fn scroll_down(&mut self) {
+        self.vertical_scroll = (self.vertical_scroll + 1) % 80;
+    }
+    fn scroll_up(&mut self) {
+        while self.vertical_scroll > 0 {
+            self.vertical_scroll = (self.vertical_scroll - 1) % 80;
+        }
+
+    }
 }
 
 // Replace the launch_tui function in main.rs
@@ -432,7 +591,7 @@ pub fn launch_tui() -> anyhow::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -470,24 +629,37 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
         if let Event::Key(key) = event::read()? {
             // Handle popup events first (highest priority)
             if app.show_generate_popup {
-                if let Some(ref mut form) = app.cert_form {
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.show_generate_popup = false;
-                            app.cert_form = None;
-                            app.status_message = "Certificate generation cancelled".to_string();
+                match key.code {
+                    KeyCode::Esc => {
+                        app.show_generate_popup = false;
+                        app.cert_form = None;
+                        app.status_message = "Certificate generation cancelled".to_string();
+                    }
+                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(form) = app.cert_form.take() {
+                            // Debug version - add step-by-step status messages
+                            app.status_message = "Starting certificate generation...".to_string();
+
+                            handle_certificate_generation(app, form);
                         }
-                        KeyCode::Tab => {
+                    }
+                    KeyCode::Tab => {
+                        if let Some(ref mut form) = app.cert_form {
                             form.next_field();
                         }
-                        KeyCode::BackTab => {
+                    }
+                    KeyCode::BackTab => {
+                        if let Some(ref mut form) = app.cert_form {
                             form.prev_field();
                         }
-                        KeyCode::Enter => {
-                            // If we're on the alt names field (index 8), add the alt name
+                    }
+                    KeyCode::Enter => {
+                        // Handle alt names on field 8
+                        if let Some(ref mut form) = app.cert_form {
                             if form.field_index == 8 {
-                                if !form.temp_alt_name.is_empty() {
-                                    form.alt_names.push(form.temp_alt_name.clone());
+                                let alt_name = form.temp_alt_name.trim().to_string();
+                                if !alt_name.is_empty() {
+                                    form.alt_names.push(alt_name);
                                     form.temp_alt_name.clear();
                                     if let Some(field) = form.fields.get_mut(8) {
                                         field.value.clear();
@@ -496,38 +668,29 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                                 }
                             }
                         }
-                        KeyCode::F(5) | KeyCode::Char(' ') => {
-                            // Take the form temporarily to avoid borrow issues
-                            if let Some(form) = app.cert_form.take() {
-                                handle_certificate_generation(app, form);
-                            }
-                        }
-                        KeyCode::F(2) => {
-                            // Reset form with F2
-                            *form = CertForm::default();
-                            if let Some(ref db_path) = app.database_path {
-                                form.database = db_path.to_string_lossy().to_string();
-                            }
-                            app.status_message = "Form reset".to_string();
-                        }
-                        KeyCode::Delete => {
-                            // Delete last alt name with Delete key
-                            if !form.alt_names.is_empty() {
-                                form.alt_names.pop();
-                                app.status_message = "Removed last alternative name".to_string();
-                            }
-                        }
-                        KeyCode::Char(c) => {
-                            form.add_char(c);
-                        }
-                        KeyCode::Backspace => {
-                            form.delete_char();
-                        }
-                        _ => {}
                     }
+                    KeyCode::Char(c) => {
+                        if let Some(ref mut form) = app.cert_form {
+                            if form.field_index < form.fields.len() {
+                                form.fields[form.field_index].value.push(c);
+                                // Update the corresponding struct field
+                                form.update_struct_field(form.field_index);
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(ref mut form) = app.cert_form {
+                            if form.field_index < form.fields.len() {
+                                form.fields[form.field_index].value.pop();
+                                form.update_struct_field(form.field_index);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                continue; // Skip other event handling when popup is open
+                continue;
             }
+
 
             if app.input_mode {
                 match key.code {
@@ -600,7 +763,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                         },
                         KeyCode::Char('c') => app.show_config(),
                         KeyCode::Char('g') => {
-                            // Show certificate generation popup
                             let mut form = CertForm::default();
 
                             // Pre-populate database path if available
@@ -610,7 +772,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
 
                             app.cert_form = Some(form);
                             app.show_generate_popup = true;
-                            app.status_message = "Fill in certificate details. Use Tab to navigate, Ctrl+G to generate".to_string();
+                            app.status_message = "Use Tab/Shift+Tab to navigate fields, type to edit, Ctrl+G to generate".to_string();
                         }
                         KeyCode::Char('s') => app.back_to_setup(),
                         _ => {}
@@ -621,6 +783,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Esc | KeyCode::Backspace => app.back_to_list(),
                         KeyCode::Char('h') => app.toggle_help(),
+                        KeyCode::Down => app.scroll_down(),
+                        KeyCode::Up => app.scroll_up(),
                         _ => {}
                     }
                 },
@@ -785,7 +949,8 @@ fn draw_config_screen<B: Backend>(f: &mut Frame, app: &App) {
          • Color Theme: {}\n\
          • Show Expired Warning: {}\n\
          • Expiry Warning Days: {}\n\
-         • Max Recent Databases: {}\n\
+         • Max Recent Databases: {:?}\n\
+         • p12 Passwords: {:#?}\n\
          \n\
          Recent Databases ({}):\n{}",
         config_path,
@@ -795,6 +960,7 @@ fn draw_config_screen<B: Backend>(f: &mut Frame, app: &App) {
         app.config.show_expired_warning,
         app.config.expiry_warning_days,
         app.config.max_recent_databases,
+        app.config.p12_passwords_print(),
         app.config.recent_databases.len(),
         app.config.recent_databases.iter()
             .take(5)
@@ -909,7 +1075,7 @@ fn draw_certificate_list<B: Backend>(f: &mut Frame, app: &mut App) {
     f.render_stateful_widget(list, chunks[1], &mut app.list_state);
 
     // Status bar with additional shortcuts
-    let status_text = format!("{} | 'l' load, 'r' reload, 's' setup, 'c' config", app.status_message);
+    let status_text = format!("{} | 'l' load, 'r' reload, 's' setup, 'c' config, 'g' generate", app.status_message);
     let status = Paragraph::new(status_text)
         .style(Style::default().fg(Color::Yellow))
         .block(Block::default().borders(Borders::ALL).title("Status"));
@@ -999,6 +1165,7 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
     let detail_paragraph = Paragraph::new(detail_text)
         .style(Style::default().fg(Color::White))
         .block(Block::default().borders(Borders::ALL))
+        .scroll((app.vertical_scroll,0))
         .wrap(Wrap { trim: true });
     f.render_widget(detail_paragraph, chunks[1]);
 
@@ -1085,30 +1252,28 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
-    // Validate form first
+    // Step 1: Validation
+    app.status_message = "Validating form...".to_string();
     if !form.validate() {
-        app.status_message = "Please fix validation errors before generating certificate".to_string();
-        // Put the form back since validation failed
+        app.status_message = "Validation failed - check required fields".to_string();
         app.cert_form = Some(form);
         return;
     }
 
-    // Ensure we have a database path
+    // Step 2: Database path
+    app.status_message = "Checking database path...".to_string();
     let database_path = if !form.database.is_empty() {
         form.database.clone()
     } else if let Some(ref db_path) = app.database_path {
         db_path.to_string_lossy().to_string()
     } else {
-        app.status_message = "No database path specified".to_string();
-        // Put the form back since we can't proceed
+        app.status_message = "No database path available".to_string();
         app.cert_form = Some(form);
         return;
     };
 
-    // Show progress message
-    app.status_message = "Generating certificate...".to_string();
-
-    // Create certificate configs
+    // Step 3: Create CA config
+    app.status_message = "Creating CA configuration...".to_string();
     let ca_config = CaConfig {
         country: form.country.clone(),
         state: form.state.clone(),
@@ -1118,6 +1283,22 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
         validity_days: form.ca_validity_days,
     };
 
+    // Step 4: Generate CA (this might be where it freezes)
+    app.status_message = "Generating CA certificate...".to_string();
+    let ca_cert = match CertificateConfig::new_ca(ca_config) {
+        Ok(cert) => {
+            app.status_message = "CA certificate created successfully".to_string();
+            cert
+        },
+        Err(e) => {
+            app.status_message = format!("CA generation failed: {}", e);
+            app.cert_form = Some(form);
+            return;
+        }
+    };
+
+    // Step 5: Create server config
+    app.status_message = "Creating server certificate configuration...".to_string();
     let server_config = ServerCertConfig {
         country: form.country.clone(),
         state: form.state.clone(),
@@ -1128,41 +1309,37 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
         validity_days: form.validity_days,
     };
 
-    // Generate certificates
-    match CertificateConfig::new_ca(ca_config) {
-        Ok(ca) => {
-            match CertificateConfig::sign_certificate(&ca, &server_config) {
-                Ok(cert) => {
-                    match save_certificates_to_json(vec![ca, cert], database_path.as_ref()) {
-                        Ok(_) => {
-                            app.status_message = "Certificate generated and saved successfully!".to_string();
-                            app.show_generate_popup = false;
-                            // Don't put form back - generation was successful, close popup
+    // Step 6: Generate server cert (another potential freeze point)
+    app.status_message = "Generating server certificate...".to_string();
+    let server_cert = match CertificateConfig::sign_certificate(&ca_cert, &server_config) {
+        Ok(cert) => {
+            app.status_message = "Server certificate created successfully".to_string();
+            cert
+        },
+        Err(e) => {
+            app.status_message = format!("Server cert generation failed: {}", e);
+            app.cert_form = Some(form);
+            return;
+        }
+    };
 
-                            // Reload certificates to show the new ones
-                            if let Some(ref path) = app.database_path.clone() {
-                                if let Err(e) = app.load_certificates(path) {
-                                    app.status_message = format!("Certificate saved but failed to reload: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            app.status_message = format!("Error saving certificates: {}", e);
-                            // Put the form back since there was an error
-                            app.cert_form = Some(form);
-                        }
-                    }
-                }
-                Err(e) => {
-                    app.status_message = format!("Error signing certificate: {}", e);
-                    // Put the form back since there was an error
-                    app.cert_form = Some(form);
+    // Step 7: Save to file (potential I/O freeze point)
+    app.status_message = "Saving certificates to database...".to_string();
+    match save_certificates_to_json(vec![ca_cert, server_cert], database_path.as_ref()) {
+        Ok(_) => {
+            app.status_message = "Certificates saved successfully!".to_string();
+            app.show_generate_popup = false;
+            app.cert_form = None;
+
+            // Step 8: Reload certificates
+            if let Some(ref path) = app.database_path.clone() {
+                if let Err(e) = app.load_certificates(path) {
+                    app.status_message = format!("Saved but reload failed: {}", e);
                 }
             }
         }
         Err(e) => {
-            app.status_message = format!("Error creating CA certificate: {}", e);
-            // Put the form back since there was an error
+            app.status_message = format!("Save failed: {}", e);
             app.cert_form = Some(form);
         }
     }
@@ -1171,154 +1348,88 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
 fn draw_cert_popup<B: Backend>(f: &mut Frame, form: &CertForm) {
     let area = f.size();
 
-    // Calculate popup size (80% of screen, but with min/max constraints)
-    let popup_width = std::cmp::min(80, std::cmp::max(60, area.width * 4 / 5));
-    let popup_height = std::cmp::min(25, std::cmp::max(20, area.height * 4 / 5));
+    // Create a reasonably sized popup (don't make it too big)
+    let popup_width = std::cmp::min(80, area.width.saturating_sub(4));
+    let popup_height = std::cmp::min(38, area.height.saturating_sub(2));
 
     let popup_area = Rect {
-        x: (area.width - popup_width) / 2,
-        y: (area.height - popup_height) / 2,
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
         width: popup_width,
         height: popup_height,
     };
 
-    // Draw background overlay
-    let overlay = Block::default()
-        .style(Style::default().bg(Color::Black).add_modifier(Modifier::DIM));
-    f.render_widget(Clear, area);
-    f.render_widget(overlay, area);
+    // Clear only the popup area (not the whole screen)
+    f.render_widget(Clear, popup_area);
 
-    // Draw main popup
+    // Draw main popup border
     let popup_block = Block::default()
-        .title("🔐 Generate Certificate")
+        .title(" Generate Certificate ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::Black));
 
     f.render_widget(popup_block, popup_area);
 
-    let inner = popup_area.inner(Margin { vertical: 1, horizontal: 2 });
+    // Get inner area for content
+    let inner = popup_area.inner(Margin { vertical: 1, horizontal: 1 });
 
-    // Split popup into sections
+    // Split into sections
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(15),     // Form fields
-            Constraint::Length(5),   // Alt names section
-            Constraint::Length(3),   // Action buttons
+            Constraint::Min(12),     // Form fields area
+            Constraint::Length(4),   // Alt names area
+            Constraint::Length(3),   // Controls area
         ])
         .split(inner);
 
-    // Draw form fields
-    draw_form_fields::<B>(f, chunks[0], form);
-
-    // Draw alt names section
-    draw_alt_names_section::<B>(f, chunks[1], form);
-
-    // Draw action buttons
+    // Draw each section
+    draw_form_fields_simple::<B>(f, chunks[0], form);
     draw_action_buttons::<B>(f, chunks[2], form);
 }
+fn draw_form_fields_simple<B: Backend>(f: &mut Frame, area: Rect, form: &CertForm) {
+    let mut lines = Vec::new();
 
-fn draw_form_fields<B: Backend>(f: &mut Frame, area: Rect, form: &CertForm) {
-    let field_height = 2;
-    let fields_per_column = (area.height as usize) / field_height;
-    let num_columns = (form.fields.len() + fields_per_column - 1) / fields_per_column;
+    // Show ALL fields including alt names (index 8)
+    for (i, field) in form.fields.iter().enumerate() {
+        let prefix = if i == form.field_index { "► " } else { "  " };
+        let suffix = if i == form.field_index { "_" } else { "" };
 
-    if num_columns <= 1 {
-        // Single column layout
-        for (i, field) in form.fields.iter().enumerate() {
-            if i >= fields_per_column { break; }
+        let line_text = if i == 8 {
+            // Special handling for alt names field
+            format!("{}Alt Names (current): {}{}", prefix, field.value, suffix)
+        } else {
+            format!("{}{}: {}{}", prefix, field.name, field.value, suffix)
+        };
 
-            let field_area = Rect {
-                x: area.x,
-                y: area.y + (i * field_height) as u16,
-                width: area.width,
-                height: field_height as u16,
-            };
+        let style = if i == form.field_index {
+            Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
 
-            draw_single_field::<B>(f, field_area, field, i == form.field_index);
-        }
-    } else {
-        // Multi-column layout
-        let column_width = area.width / num_columns as u16;
+        lines.push(Line::from(Span::styled(line_text, style)));
+    }
 
-        for (i, field) in form.fields.iter().enumerate() {
-            let column = i / fields_per_column;
-            let row = i % fields_per_column;
-
-            if row >= area.height as usize / field_height { continue; }
-
-            let field_area = Rect {
-                x: area.x + (column as u16 * column_width),
-                y: area.y + (row * field_height) as u16,
-                width: column_width - 1,
-                height: field_height as u16,
-            };
-
-            draw_single_field::<B>(f, field_area, field, i == form.field_index);
+    // Add a separator and show current alt names list
+    if !form.alt_names.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Added Alt Names:", Style::default().fg(Color::Cyan))));
+        for (i, alt_name) in form.alt_names.iter().enumerate() {
+            lines.push(Line::from(Span::styled(
+                format!("  {}. {}", i + 1, alt_name),
+                Style::default().fg(Color::Green)
+            )));
         }
     }
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Certificate Fields"))
+        .wrap(ratatui::widgets::Wrap { trim: true });
+
+    f.render_widget(paragraph, area);
 }
-
-fn draw_single_field<B: Backend>(f: &mut Frame, area: Rect, field: &FormField, is_active: bool) {
-    let field_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(15), // Label
-            Constraint::Min(0),     // Input
-        ])
-        .split(area);
-
-    // Label
-    let label_style = if field.required {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-
-    let label_text = if field.required {
-        format!("{}*:", field.name)
-    } else {
-        format!("{}:", field.name)
-    };
-
-    let label = Paragraph::new(label_text)
-        .style(label_style)
-        .alignment(Alignment::Right);
-    f.render_widget(label, field_chunks[0]);
-
-    // Input field
-    let input_style = if is_active {
-        Style::default().fg(Color::Yellow).bg(Color::DarkGray)
-    } else if field.validation_error.is_some() {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(Color::White)
-    };
-
-    let input_text = if is_active {
-        format!("{}_", field.value)
-    } else {
-        field.value.clone()
-    };
-
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(if is_active {
-            Style::default().fg(Color::Yellow)
-        } else if field.validation_error.is_some() {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default().fg(Color::Gray)
-        });
-
-    let input = Paragraph::new(input_text)
-        .style(input_style)
-        .block(input_block);
-
-    f.render_widget(input, field_chunks[1]);
-}
-
 fn draw_alt_names_section<B: Backend>(f: &mut Frame, area: Rect, form: &CertForm) {
     let block = Block::default()
         .title("Alternative Names")
@@ -1354,17 +1465,17 @@ fn draw_action_buttons<B: Backend>(f: &mut Frame, area: Rect, _form: &CertForm) 
             Span::styled("Tab/Shift+Tab", Style::default().fg(Color::Yellow)),
             Span::raw(": Navigate • "),
             Span::styled("Enter", Style::default().fg(Color::Green)),
-            Span::raw(": Add Alt Name / Generate • "),
+            Span::raw(": Add Alt Name • "),
             Span::styled("Ctrl+G", Style::default().fg(Color::Green)),
             Span::raw(": Generate Certificate"),
         ]),
         Line::from(vec![
-            Span::styled("Ctrl+D", Style::default().fg(Color::Red)),
-            Span::raw(": Delete Alt Name • "),
+            Span::styled("Delete", Style::default().fg(Color::Red)),
+            Span::raw(": Remove Alt Name • "),
+            Span::styled("F2", Style::default().fg(Color::Blue)),
+            Span::raw(": Reset Form • "),
             Span::styled("Esc", Style::default().fg(Color::Red)),
-            Span::raw(": Cancel • "),
-            Span::styled("Ctrl+R", Style::default().fg(Color::Blue)),
-            Span::raw(": Reset Form"),
+            Span::raw(": Cancel"),
         ]),
     ];
 

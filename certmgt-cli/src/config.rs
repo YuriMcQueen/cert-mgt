@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, io, path::PathBuf};
 use std::path::Path;
 use dirs::home_dir;
+use rpassword::read_password;
+use toml::value::Time;
 use certmgt_lib::CertificateConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +30,21 @@ pub struct TuiConfig {
     pub p12_passwords: Option<PasswordSourceConfig>,
 }
 
+impl TuiConfig {
+    pub fn p12_passwords_print(&self) -> String {
+        match self.p12_passwords {
+            Some(PasswordSourceConfig::Map(ref map)) => {
+                map.iter().map(|(x, y)| format!("{}:{}", x, y)).collect::<Vec<_>>().join(",")
+            }
+            Some(PasswordSourceConfig::List(ref list)) => {
+                list.join(",")
+            },
+            None => {
+                String::from("")
+            }
+        }
+    }
+}
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
@@ -93,7 +110,7 @@ impl TuiConfig {
         file_path: &std::path::Path,
     ) -> Option<CertificateConfig> {
         let file_name = file_path.file_name()?.to_string_lossy().to_string();
-
+        eprintln!("DEBUG: Loaded p12_passwords = {:?}", self.p12_passwords);
         // 1. Try explicit map
         if let Some(PasswordSourceConfig::Map(map)) = &self.p12_passwords {
             if let Some(pw) = map.get(&file_name) {
@@ -101,7 +118,7 @@ impl TuiConfig {
                     CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(pw))
                 {
                     return Some(config);
-                }
+                } else { eprintln!("Warning: Failed to read config file: {}", file_name); }
             }
         }
 
@@ -112,19 +129,17 @@ impl TuiConfig {
                     CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(pw))
                 {
                     return Some(config);
-                }
+                } else { eprintln!("Warning: Failed to read config file: {}", file_name); }
             }
         }
 
         // 3. Fallback to interactive input
         // (optional: only if in TUI/CLI context)
         println!("Enter password for {}: ", file_name);
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_ok() {
-            let input = input.trim();
-            if !input.is_empty() {
+        if let Ok(password) = read_password() {
+            if !password.is_empty() {
                 if let Ok(config) =
-                    CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(input))
+                    CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password))
                 {
                     return Some(config);
                 }

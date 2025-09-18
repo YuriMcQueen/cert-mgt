@@ -98,13 +98,6 @@ fn main() -> anyhow::Result<()> {
             let mut final_configs = Vec::new();
             let mut seen = HashSet::new();
 
-            // Decide password source: CLI > config > None
-            let password_source = if let Some(ref pwfile) = password_file {
-                Some(load_passwords(pwfile)?)
-            } else {
-                config.p12_passwords.clone()
-            };
-
             // Load database if it exists (append mode by default)
             if database.exists() {
                 match load_certificates_from_database(&database) {
@@ -146,50 +139,26 @@ fn main() -> anyhow::Result<()> {
                                     .and_then(|f| f.to_str())
                                     .unwrap_or_default();
 
-                                let mut tried = false;
-
-                                if let Some(ref source) = password_source {
-                                    match source {
-                                        PasswordSourceConfig::Map(map) => {
-                                            if let Some(pw) = map.get(fname) {
-                                                tried = true;
-                                                if let Ok(config) = CertificateConfig::read_from_path(
-                                                    file_path.to_str().unwrap(),
-                                                    Some(pw),
-                                                ) {
-                                                    break config;
-                                                }
-                                            }
-                                        }
-                                        PasswordSourceConfig::List(list) => {
-                                            tried = true;
-                                            if let Some(config) = list.iter()
-                                                .find_map(|pw| CertificateConfig::read_from_path(
-                                                    file_path.to_str().unwrap(),
-                                                    Some(pw),
-                                                ).ok())
-                                            {
-                                                break config;
-                                            }
-                                        }
-                                    }
+                                // 1. Try config-driven password logic
+                                if let Some(configured) = config.try_passwords_for_file(&file_path) {
+                                    break configured;
                                 }
 
-                                // If no provided password worked, ask interactively
-                                if !tried {
-                                    eprintln!("P12 file {} requires a password.", file_path.display());
-                                    eprint!("Enter password: ");
-                                    io::stdout().flush()?;
-                                    let password = rpassword::read_password()?;
-                                    match CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password)) {
-                                        Ok(config) => break config,
-                                        Err(e) => {
-                                            eprintln!("Error reading {} with password: {}", file_path.display(), e);
-                                            continue 'outer;
-                                        }
+                                // 2. If we got here, no configured password worked → interactive fallback
+                                eprintln!("P12 file {} requires a password.", file_path.display());
+                                eprint!("Enter password: ");
+                                io::stdout().flush()?;
+                                let password = rpassword::read_password()?;
+                                match CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password)) {
+                                    Ok(config) => break config,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "Error reading {} with password: {}",
+                                            file_path.display(),
+                                            e
+                                        );
+                                        continue 'outer;
                                     }
-                                } else {
-                                    continue 'outer;
                                 }
                             }
 
