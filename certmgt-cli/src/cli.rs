@@ -1,5 +1,6 @@
-use std::path::PathBuf;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -18,7 +19,12 @@ pub enum Commands {
         country: String,
         #[arg(long, short = 's', help = "State", default_value = "IL")]
         state: String,
-        #[arg(long, short = 'o', help = "Organization", default_value = "Example Inc")]
+        #[arg(
+            long,
+            short = 'o',
+            help = "Organization",
+            default_value = "Example Inc"
+        )]
         organization: String,
         #[arg(long, help = "Common name", default_value = "example.com")]
         common_name: String,
@@ -32,7 +38,6 @@ pub enum Commands {
         ca_validity_days: u32,
         #[arg(long, help = "Output database file (.json or .json.gz)")]
         database: PathBuf,
-
     },
     /// Read certificates from a file (JSON, parquet, PEM, or P12) and display them
     Read {

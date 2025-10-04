@@ -1,26 +1,31 @@
-use x509_parser::prelude::ASN1Time;
+use crate::CertMgtError;
 use rand::{RngCore, thread_rng};
-use time::{OffsetDateTime};
+use time::OffsetDateTime;
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::time::Time;
-use crate::CertMgtError;
+use x509_parser::prelude::ASN1Time;
 
 pub fn asn1_time_to_timestamp(asn1_time: &ASN1Time) -> i64 {
     asn1_time.timestamp()
 }
 pub fn create_time_from_offset_datetime(dt: OffsetDateTime) -> Result<Time, CertMgtError> {
-    use der::asn1::{UtcTime, GeneralizedTime};
+    use der::asn1::{GeneralizedTime, UtcTime};
 
     // X.509 uses UTCTime for dates before 2050 and GeneralizedTime for dates 2050 and later
     if dt.year() < 2050 {
-        let utc_time = UtcTime::from_unix_duration(
-            std::time::Duration::from_secs(dt.unix_timestamp() as u64)
-        ).map_err(|e| CertMgtError::CaGenerationError(format!("UTC time creation failed: {}", e)))?;
+        let utc_time =
+            UtcTime::from_unix_duration(std::time::Duration::from_secs(dt.unix_timestamp() as u64))
+                .map_err(|e| {
+                    CertMgtError::CaGenerationError(format!("UTC time creation failed: {}", e))
+                })?;
         Ok(Time::UtcTime(utc_time))
     } else {
-        let gen_time = GeneralizedTime::from_unix_duration(
-            std::time::Duration::from_secs(dt.unix_timestamp() as u64)
-        ).map_err(|e| CertMgtError::CaGenerationError(format!("Generalized time creation failed: {}", e)))?;
+        let gen_time = GeneralizedTime::from_unix_duration(std::time::Duration::from_secs(
+            dt.unix_timestamp() as u64,
+        ))
+        .map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Generalized time creation failed: {}", e))
+        })?;
         Ok(Time::GeneralTime(gen_time))
     }
 }

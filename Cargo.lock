@@ -271,6 +271,7 @@ dependencies = [
  "crossterm 0.29.0",
  "dirs",
  "flate2",
+ "hex",
  "pem",
  "predicates 2.1.5",
  "ratatui",

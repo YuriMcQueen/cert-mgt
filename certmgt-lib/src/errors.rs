@@ -25,7 +25,7 @@ pub enum CertMgtError {
 
     #[error("Key generation failed: {0}")]
     KeyGenerationError(String),
-    
+
     #[error("Error extracting key: {0}")]
     KeyExtractionError(String),
 
@@ -70,6 +70,5 @@ pub enum CertMgtError {
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Error: {0}")]
-    SerialNumberError(#[from]  der::Error),
-
+    SerialNumberError(#[from] der::Error),
 }

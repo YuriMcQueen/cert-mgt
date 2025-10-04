@@ -1,23 +1,21 @@
-mod tui;
 mod cli;
-mod json;
 mod config;
+mod json;
+mod tui;
 
-use std::collections::{HashMap, HashSet};
-use std::io;
-use std::io::Write;
-use certmgt_lib::filters::filter_certificates;
-use certmgt_lib::{CertData, CertMgtError, CertificateConfig};
+use crate::cli::{Commands, ListType};
+use crate::config::{TuiConfig};
 use crate::json::*;
+use crate::tui::launch_tui;
+use certmgt_lib::filters::filter_certificates;
+use certmgt_lib::types::{CaConfig, ServerCertConfig};
+use certmgt_lib::{CertData, CertMgtError, CertificateConfig};
 use clap::Parser;
 use serde::de::Error;
-use std::path::{Path, PathBuf};
-use certmgt_lib::types::{CaConfig, ServerCertConfig};
-use crate::cli::{Commands, ListType};
-use crate::tui::launch_tui;
-use walkdir::WalkDir;
 use sha2::{Digest, Sha256};
-use crate::config::{load_passwords, PasswordSourceConfig, TuiConfig};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
@@ -38,7 +36,8 @@ fn main() -> anyhow::Result<()> {
             let configs: Vec<CertificateConfig> = if is_database_file(&path) {
                 // Read from database file
                 let certificates = load_certificates_from_database(&path)?;
-                let filtered_configs = filter_certificates(certificates, filters.clone(), or_logic)?;
+                let filtered_configs =
+                    filter_certificates(certificates, filters.clone(), or_logic)?;
 
                 let logic_type = if or_logic { "OR" } else { "AND" };
                 println!(
@@ -87,7 +86,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-
         Commands::Import {
             inputs,
             database,
@@ -95,160 +93,7 @@ fn main() -> anyhow::Result<()> {
             force,
             password_file,
         } => {
-            let mut final_configs = Vec::new();
-            let mut seen = HashSet::new();
-
-            // Load database if it exists (append mode by default)
-            if database.exists() {
-                match load_certificates_from_database(&database) {
-                    Ok(existing) => {
-                        println!("Found {} existing certificates in database", existing.len());
-                        for cert in &existing {
-                            seen.insert(cert_fingerprint(&cert.cert_data));
-                        }
-                        final_configs.extend(existing);
-                    }
-                    Err(e) => {
-                        eprintln!("Error reading existing database: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            let mut imported_count = 0;
-            let mut skipped_count = 0;
-            let mut overridden_count = 0;
-
-            // Process inputs
-            for p in &inputs {
-                let discovered_files = discover_cert_files(p);
-                if discovered_files.is_empty() {
-                    eprintln!("No certificates found in {}", p.display());
-                    continue;
-                }
-                println!("Found {} certificates", discovered_files.len());
-
-                'outer: for file_path in discovered_files {
-                    let config = loop {
-                        match CertificateConfig::read_from_path(file_path.to_str().unwrap_or_default(), None) {
-                            Ok(config) => break config,
-
-                            // P12 requires password
-                            Err(e) if e.to_string().contains("requires a password") => {
-                                let fname = file_path.file_name()
-                                    .and_then(|f| f.to_str())
-                                    .unwrap_or_default();
-
-                                // 1. Try config-driven password logic
-                                if let Some(configured) = config.try_passwords_for_file(&file_path) {
-                                    break configured;
-                                }
-
-                                // 2. If we got here, no configured password worked → interactive fallback
-                                eprintln!("P12 file {} requires a password.", file_path.display());
-                                eprint!("Enter password: ");
-                                io::stdout().flush()?;
-                                let password = rpassword::read_password()?;
-                                match CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password)) {
-                                    Ok(config) => break config,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "Error reading {} with password: {}",
-                                            file_path.display(),
-                                            e
-                                        );
-                                        continue 'outer;
-                                    }
-                                }
-                            }
-
-                            // PEM only key
-                            Err(e) if e.to_string().contains("PEM file contains only private key") => {
-                                eprintln!("Found PEM key only: {}", file_path.display());
-                                let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
-                                let candidates = discover_cert_files(dir);
-
-                                let matching_cert_path = candidates.into_iter()
-                                    .filter(|p| *p != file_path)
-                                    .find(|p| {
-                                        CertificateConfig::read_from_path(p.to_str().unwrap(), None)
-                                            .map(|c| c.matches_key_file(&file_path))
-                                            .unwrap_or(false)
-                                    });
-
-                                if let Some(cert_path) = matching_cert_path {
-                                    eprintln!("Found matching certificate: {}", cert_path.display());
-
-                                    match CertificateConfig::read_from_path(cert_path.to_str().unwrap(), None) {
-                                        Ok(mut cert_config) => {
-                                            match cert_config.attach_key_from_file(&file_path, None) {
-                                                Ok(_) => break cert_config,
-                                                Err(e) => {
-                                                    eprintln!("Error attaching key: {}", e);
-                                                    continue 'outer;
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Error reading certificate {}: {}", cert_path.display(), e);
-                                            continue 'outer;
-                                        }
-                                    }
-                                } else {
-                                    eprintln!("No matching certificate found for key {}", file_path.display());
-                                    continue 'outer;
-                                }
-                            }
-
-                            Err(e) => {
-                                eprintln!("Error reading {}: {}", file_path.display(), e);
-                                continue 'outer;
-                            }
-                        }
-                    };
-
-                    let fp = cert_fingerprint(&config.cert_data);
-                    let common_name = config.common_name.clone();
-                    if seen.contains(&fp) {
-                        if force {
-                            println!("Overriding duplicate: {}", common_name);
-                            overridden_count += 1;
-                            final_configs.retain(|c| cert_fingerprint(&c.cert_data) != fp);
-                        } else {
-                            println!("Skipping duplicate: {}", common_name);
-                            skipped_count += 1;
-                            continue;
-                        }
-                    } else {
-                        imported_count += 1;
-                    }
-
-                    seen.insert(fp);
-                    final_configs.push(config);
-                }
-            }
-
-            // Save database
-            let use_compression = compressed || is_compressed_file(&database);
-
-            let result = if use_compression {
-                save_certificates_to_json_compressed(final_configs.clone(), &database)
-            } else {
-                save_certificates_to_json(final_configs.clone(), &database)
-            };
-
-            match result {
-                Ok(_) => {
-                    println!(
-                        "✅ Import complete: {} new, {} skipped, {} overridden",
-                        imported_count, skipped_count, overridden_count
-                    );
-                }
-                Err(e) => {
-                    eprintln!("Error saving to database: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            import(&config, inputs, database, compressed, force, password_file)?;
         }
 
         Commands::Export {
@@ -565,8 +410,19 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
-        },
-        Commands::Generate { validity_days, country, state, organization, common_name, key_size, alt_names, ca_validity_days,ca_key_size, database } => {
+        }
+        Commands::Generate {
+            validity_days,
+            country,
+            state,
+            organization,
+            common_name,
+            key_size,
+            alt_names,
+            ca_validity_days,
+            ca_key_size,
+            database,
+        } => {
             let new_ca_config = CaConfig {
                 country: country.clone(),
                 state: state.clone(),
@@ -589,7 +445,6 @@ fn main() -> anyhow::Result<()> {
             println!("{:?}", ca.cert_data);
             let cert = CertificateConfig::sign_certificate(&ca, &new_cert_config)?;
             save_certificates_to_json(vec![ca, cert], &database)?;
-
         }
     }
     Ok(())
@@ -984,7 +839,12 @@ fn discover_cert_files(path: &Path) -> Vec<PathBuf> {
                 e.path()
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .map(|ext| matches!(ext.to_lowercase().as_str(), "crt" | "pem" | "cer" | "der" | "p12"| "txt" |"b64"))
+                    .map(|ext| {
+                        matches!(
+                            ext.to_lowercase().as_str(),
+                            "crt" | "pem" | "cer" | "der" | "p12" | "txt" | "b64"
+                        )
+                    })
                     .unwrap_or(false)
             })
             .map(|e| e.path().to_path_buf())
@@ -993,30 +853,51 @@ fn discover_cert_files(path: &Path) -> Vec<PathBuf> {
         vec![]
     }
 }
+//
+// fn cert_fingerprint(cert_data: &CertData) -> String {
+//     match cert_data {
+//         CertData::Pem { cert, key } => {
+//             // You can decide whether to include `key` in the fingerprint.
+//             // If you include it, same cert with different private key is treated as different.
+//             let mut hasher = Sha256::new();
+//             hasher.update(cert.as_bytes());
+//             if let Some(k) = key {
+//                 hasher.update(k.as_bytes());
+//             }
+//             format!("{:x}", hasher.finalize())
+//         }
+//         CertData::P12 {
+//             data, as_base64, ..
+//         } => {
+//             let mut hasher = Sha256::new();
+//             if *as_base64 {
+//                 // Already base64 string, hash as-is
+//                 hasher.update(data.as_bytes());
+//             } else {
+//                 // If not base64, treat as raw binary
+//                 hasher.update(data.as_bytes());
+//             }
+//             format!("{:x}", hasher.finalize())
+//         }
+//     }
+// }
 
-fn cert_fingerprint(cert_data: &CertData) -> String {
+fn cert_fingerprint_bytes(cert_data: &CertData) -> Vec<u8> {
+    let mut hasher = Sha256::new();
     match cert_data {
         CertData::Pem { cert, key } => {
-            // You can decide whether to include `key` in the fingerprint.
-            // If you include it, same cert with different private key is treated as different.
-            let mut hasher = Sha256::new();
             hasher.update(cert.as_bytes());
             if let Some(k) = key {
                 hasher.update(k.as_bytes());
             }
-            format!("{:x}", hasher.finalize())
         }
-        CertData::P12 { data, as_base64, .. } => {
-            let mut hasher = Sha256::new();
-            if *as_base64 {
-                // Already base64 string, hash as-is
-                hasher.update(data.as_bytes());
-            } else {
-                // If not base64, treat as raw binary
-                hasher.update(data.as_bytes());
-            }
-            format!("{:x}", hasher.finalize())
+        CertData::P12 { data, .. } => {
+            hasher.update(data.as_bytes());
         }
     }
+    hasher.finalize().to_vec()
 }
 
+fn cert_fingerprint(cert_data: &CertData) -> String {
+    hex::encode(cert_fingerprint_bytes(cert_data))
+}

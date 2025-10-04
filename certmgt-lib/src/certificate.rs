@@ -1,43 +1,45 @@
+use crate::CertMgtError;
 use crate::detection::detect_cert_type;
 use crate::types::{CaConfig, CertData, CertDataType, CertificateConfig, ServerCertConfig};
-use crate::utils::{asn1_time_to_timestamp, create_time_from_offset_datetime, generate_secure_serial_number};
-use crate::CertMgtError;
-use base64::prelude::BASE64_STANDARD;
+use crate::utils::{
+    asn1_time_to_timestamp, create_time_from_offset_datetime, generate_secure_serial_number,
+};
 use base64::Engine as _;
+use base64::prelude::BASE64_STANDARD;
 
-use std::error::Error;
+use const_oid::db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION;
+use der::asn1::Null;
+use der::{Any, Decode, Encode};
 use p12_keystore::{KeyStore, KeyStoreEntry};
-use pem::{parse, parse_many, Pem};
-use x509_parser::asn1_rs::{FromDer, Oid};
-use x509_parser::certificate::X509Certificate;
-use x509_parser::oid_registry;
-use x509_parser::public_key::PublicKey;
+use pem::{Pem, parse, parse_many};
+use rand::thread_rng;
+use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPublicKey};
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
+use rsa::sha2::Sha256;
+use rsa::signature::{SignatureEncoding, Signer};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs1v15::SigningKey};
+use spki::{AlgorithmIdentifier, SubjectPublicKeyInfo};
+use std::error::Error;
+use std::net::IpAddr;
+use std::path::Path;
+use time::{Duration, OffsetDateTime};
+use x509_cert::attr::AttributeTypeAndValue;
+use x509_cert::ext::pkix::KeyUsages;
 use x509_cert::{
     Certificate, TbsCertificate, Version,
+    ext::{
+        Extension, Extensions,
+        pkix::{AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, SubjectAltName},
+    },
     name::{Name, RelativeDistinguishedName},
     serial_number::SerialNumber,
     time::Validity,
-    ext::{
-        Extension, Extensions,
-        pkix::{BasicConstraints, ExtendedKeyUsage, SubjectAltName, AuthorityKeyIdentifier}
-    },
 };
-use rand::thread_rng;
-use der::{Encode, Decode, Any};
-use spki::{SubjectPublicKeyInfo, AlgorithmIdentifier};
-use time::{OffsetDateTime, Duration};
-use std::net::IpAddr;
-use std::path::Path;
-use const_oid::db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION;
-use der::asn1::Null;
-use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPublicKey};
-use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, DecodePrivateKey};
-use rsa::sha2::Sha256;
-use rsa::signature::{SignatureEncoding, Signer};
-use x509_cert::attr::AttributeTypeAndValue;
-use x509_cert::ext::pkix::KeyUsages;
+use x509_parser::asn1_rs::{FromDer, Oid};
+use x509_parser::certificate::X509Certificate;
+use x509_parser::oid_registry;
 use x509_parser::pem::parse_x509_pem;
+use x509_parser::public_key::PublicKey;
 
 impl CertificateConfig {
     pub fn read_from_path(path: &str, password: Option<&str>) -> Result<Self, CertMgtError> {
@@ -56,16 +58,12 @@ impl CertificateConfig {
                 Self::parse_pem_cert_only(content)
                     .map_err(|e| CertMgtError::InvalidConfiguration(format!("{}: {}", path, e)))
             }
-            CertDataType::PemOnlyKey => {
-                Err(CertMgtError::InvalidPrivateKey(format!(
-                    "PEM file {} contains only private key, no certificate",
-                    path
-                )))
-            }
-            CertDataType::P12 { as_base64 } => {
-                Self::parse_p12(&bytes, password, as_base64)
-                    .map_err(|e| CertMgtError::InvalidConfiguration(format!("{}: {}", path, e)))
-            }
+            CertDataType::PemOnlyKey => Err(CertMgtError::InvalidPrivateKey(format!(
+                "PEM file {} contains only private key, no certificate",
+                path
+            ))),
+            CertDataType::P12 { as_base64 } => Self::parse_p12(&bytes, password, as_base64)
+                .map_err(|e| CertMgtError::InvalidConfiguration(format!("{}: {}", path, e))),
         }
     }
     fn parse_pem_cert_and_key(content: &str) -> Result<Self, Box<dyn Error>> {
@@ -190,7 +188,7 @@ impl CertificateConfig {
                             let (_, parsed_cert) = X509Certificate::from_der(cert_der)?;
                             all_certs.push(parsed_cert);
                         }
-                    },
+                    }
                     KeyStoreEntry::Certificate(cert) => {
                         let cert_der = cert.as_der();
                         let (_, parsed_cert) = X509Certificate::from_der(cert_der)?;
@@ -199,7 +197,7 @@ impl CertificateConfig {
                         if leaf_cert.is_none() && parsed_cert.subject() != parsed_cert.issuer() {
                             leaf_cert = Some(parsed_cert);
                         }
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -207,9 +205,12 @@ impl CertificateConfig {
 
         // Fallback if no clear leaf certificate
         if leaf_cert.is_none() && !all_certs.is_empty() {
-            let longest_subject_cert = all_certs.iter()
+            let longest_subject_cert = all_certs
+                .iter()
                 .max_by_key(|cert| cert.subject().to_string().len());
-            leaf_cert = longest_subject_cert.cloned().or_else(|| all_certs.first().cloned());
+            leaf_cert = longest_subject_cert
+                .cloned()
+                .or_else(|| all_certs.first().cloned());
         }
 
         let cert = leaf_cert.ok_or("No leaf certificate found in PKCS#12")?;
@@ -235,8 +236,10 @@ impl CertificateConfig {
     /// Create a new CA certificate
     pub fn new_ca(config: CaConfig) -> Result<Self, CertMgtError> {
         // Generate RSA key pair
-        let private_key = RsaPrivateKey::new(&mut thread_rng(), config.key_size as usize)
-            .map_err(|e| CertMgtError::CaGenerationError(format!("Key generation failed: {}", e)))?;
+        let private_key =
+            RsaPrivateKey::new(&mut thread_rng(), config.key_size as usize).map_err(|e| {
+                CertMgtError::CaGenerationError(format!("Key generation failed: {}", e))
+            })?;
         let public_key = RsaPublicKey::from(&private_key);
 
         // Create subject name
@@ -251,15 +254,20 @@ impl CertificateConfig {
         let now = OffsetDateTime::now_utc();
         let not_before = create_time_from_offset_datetime(now)
             .map_err(|e| CertMgtError::CaGenerationError(format!("Invalid start time: {}", e)))?;
-        let not_after = create_time_from_offset_datetime(now + Duration::days(config.validity_days as i64))?;
-        let validity = Validity { not_before, not_after };
+        let not_after =
+            create_time_from_offset_datetime(now + Duration::days(config.validity_days as i64))?;
+        let validity = Validity {
+            not_before,
+            not_after,
+        };
 
         // Generate serial number
         let serial_number = SerialNumber::from(1u32);
 
         // Create subject public key info
-        let subject_public_key_info = public_key.to_public_key_der()
-            .map_err(|e| CertMgtError::CaGenerationError(format!("Public key encoding failed: {}", e)))?;
+        let subject_public_key_info = public_key.to_public_key_der().map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Public key encoding failed: {}", e))
+        })?;
         let spki = SubjectPublicKeyInfo::from_der((&subject_public_key_info).as_ref())
             .map_err(|e| CertMgtError::CaGenerationError(format!("SPKI parsing failed: {}", e)))?;
 
@@ -281,7 +289,8 @@ impl CertificateConfig {
         };
 
         // Sign the certificate
-        let tbs_der = tbs_cert.to_der()
+        let tbs_der = tbs_cert
+            .to_der()
             .map_err(|e| CertMgtError::CaGenerationError(format!("TBS encoding failed: {}", e)))?;
         let signature = sign_with_rsa_sha256(&private_key, &tbs_der)?;
 
@@ -289,17 +298,23 @@ impl CertificateConfig {
         let certificate = Certificate {
             tbs_certificate: tbs_cert,
             signature_algorithm: rsa_with_sha256_algorithm_identifier(),
-            signature: der::asn1::BitString::from_bytes(&signature)
-                .map_err(|e| CertMgtError::CaGenerationError(format!("Signature BitString creation failed: {}", e)))?,
+            signature: der::asn1::BitString::from_bytes(&signature).map_err(|e| {
+                CertMgtError::CaGenerationError(format!(
+                    "Signature BitString creation failed: {}",
+                    e
+                ))
+            })?,
         };
 
         // Encode to PEM
-        let cert_der = certificate.to_der()
-            .map_err(|e| CertMgtError::CaGenerationError(format!("Certificate encoding failed: {}", e)))?;
+        let cert_der = certificate.to_der().map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Certificate encoding failed: {}", e))
+        })?;
         let cert_pem = pem_encode("CERTIFICATE", &cert_der);
 
-        let key_der = private_key.to_pkcs8_der()
-            .map_err(|e| CertMgtError::CaGenerationError(format!("Private key encoding failed: {}", e)))?;
+        let key_der = private_key.to_pkcs8_der().map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Private key encoding failed: {}", e))
+        })?;
         let key_pem = pem_encode("PRIVATE KEY", key_der.as_bytes());
 
         Ok(CertificateConfig {
@@ -327,14 +342,17 @@ impl CertificateConfig {
         config: &ServerCertConfig,
     ) -> Result<CertificateConfig, CertMgtError> {
         if !self.is_ca {
-            return Err(CertMgtError::InvalidConfiguration("Not a CA certificate".to_string()));
+            return Err(CertMgtError::InvalidConfiguration(
+                "Not a CA certificate".to_string(),
+            ));
         }
 
         let mut rng = thread_rng();
 
         // Generate new key pair for the server certificate
-        let private_key = RsaPrivateKey::new(&mut rng, config.key_size)
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("Key generation failed: {}", e)))?;
+        let private_key = RsaPrivateKey::new(&mut rng, config.key_size).map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!("Key generation failed: {}", e))
+        })?;
         let public_key = RsaPublicKey::from(&private_key);
 
         // Extract CA private key for signing
@@ -360,20 +378,30 @@ impl CertificateConfig {
         let now = OffsetDateTime::now_utc();
         let not_before = create_time_from_offset_datetime(now)
             .map_err(|e| CertMgtError::CaGenerationError(format!("Invalid start time: {}", e)))?;
-        let not_after = create_time_from_offset_datetime(now + Duration::days(config.validity_days as i64))?;
-        let validity = Validity { not_before, not_after };
-
+        let not_after =
+            create_time_from_offset_datetime(now + Duration::days(config.validity_days as i64))?;
+        let validity = Validity {
+            not_before,
+            not_after,
+        };
 
         // Generate serial number
         let serial_num = generate_secure_serial_number()?;
-        let serial_number = SerialNumber::new(&serial_num.as_bytes())
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("Serial number creation failed: {}", e)))?;
+        let serial_number = SerialNumber::new(&serial_num.as_bytes()).map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!(
+                "Serial number creation failed: {}",
+                e
+            ))
+        })?;
 
         // Create subject public key info
-        let subject_public_key_info = public_key.to_public_key_der()
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("Public key encoding failed: {}", e)))?;
-        let spki = SubjectPublicKeyInfo::from_der(&subject_public_key_info.as_ref())
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("SPKI parsing failed: {}", e)))?;
+        let subject_public_key_info = public_key.to_public_key_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!("Public key encoding failed: {}", e))
+        })?;
+        let spki =
+            SubjectPublicKeyInfo::from_der(&subject_public_key_info.as_ref()).map_err(|e| {
+                CertMgtError::CertificateGenerationError(format!("SPKI parsing failed: {}", e))
+            })?;
 
         // Create extensions for server certificate
         let extensions = create_server_extensions(&config.alt_names, &self.get_ca_public_key()?)?;
@@ -393,8 +421,9 @@ impl CertificateConfig {
         };
 
         // Sign the certificate with CA private key
-        let tbs_der = tbs_cert.to_der()
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("TBS encoding failed: {}", e)))?;
+        let tbs_der = tbs_cert.to_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!("TBS encoding failed: {}", e))
+        })?;
 
         let signature = sign_with_rsa_sha256(&ca_private_key, &tbs_der)?;
 
@@ -402,17 +431,23 @@ impl CertificateConfig {
         let certificate = Certificate {
             tbs_certificate: tbs_cert,
             signature_algorithm: rsa_with_sha256_algorithm_identifier(),
-            signature: der::asn1::BitString::from_bytes(&signature)
-                .map_err(|e| CertMgtError::CertificateGenerationError(format!("Signature BitString creation failed: {}", e)))?,
+            signature: der::asn1::BitString::from_bytes(&signature).map_err(|e| {
+                CertMgtError::CertificateGenerationError(format!(
+                    "Signature BitString creation failed: {}",
+                    e
+                ))
+            })?,
         };
 
         // Encode to PEM
-        let cert_der = certificate.to_der()
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("Certificate encoding failed: {}", e)))?;
+        let cert_der = certificate.to_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!("Certificate encoding failed: {}", e))
+        })?;
         let cert_pem = pem_encode("CERTIFICATE", &cert_der);
 
-        let key_der = private_key.to_pkcs8_der()
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("Private key encoding failed: {}", e)))?;
+        let key_der = private_key.to_pkcs8_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!("Private key encoding failed: {}", e))
+        })?;
         let key_pem = pem_encode("PRIVATE KEY", key_der.as_bytes());
 
         Ok(CertificateConfig {
@@ -473,18 +508,29 @@ impl CertificateConfig {
         let now = OffsetDateTime::now_utc();
         let not_before = create_time_from_offset_datetime(now)
             .map_err(|e| CertMgtError::CaGenerationError(format!("Invalid start time: {}", e)))?;
-        let not_after = create_time_from_offset_datetime(now + Duration::days(new_validity_days as i64))?;
-        let validity = Validity { not_before, not_after };
+        let not_after =
+            create_time_from_offset_datetime(now + Duration::days(new_validity_days as i64))?;
+        let validity = Validity {
+            not_before,
+            not_after,
+        };
 
         // Set serial number
-        let serial_number = SerialNumber::new(&next_serial.to_be_bytes())
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("Serial number creation failed: {}", e)))?;
+        let serial_number = SerialNumber::new(&next_serial.to_be_bytes()).map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!(
+                "Serial number creation failed: {}",
+                e
+            ))
+        })?;
 
         // Create subject public key info
-        let subject_public_key_info = public_key.to_public_key_der()
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("Public key encoding failed: {}", e)))?;
-        let spki = SubjectPublicKeyInfo::from_der(&subject_public_key_info.as_ref())
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("SPKI parsing failed: {}", e)))?;
+        let subject_public_key_info = public_key.to_public_key_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!("Public key encoding failed: {}", e))
+        })?;
+        let spki =
+            SubjectPublicKeyInfo::from_der(&subject_public_key_info.as_ref()).map_err(|e| {
+                CertMgtError::CertificateGenerationError(format!("SPKI parsing failed: {}", e))
+            })?;
 
         // Create extensions (using empty alt_names - you might want to extract from original cert)
         let extensions = create_server_extensions(&[], &ca_cert.get_ca_public_key()?)?;
@@ -504,26 +550,33 @@ impl CertificateConfig {
         };
 
         // Sign with CA private key
-        let tbs_der = tbs_cert.to_der()
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("TBS encoding failed: {}", e)))?;
-       
+        let tbs_der = tbs_cert.to_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!("TBS encoding failed: {}", e))
+        })?;
+
         let signature = sign_with_rsa_sha256(&ca_private_key, &tbs_der)?;
-        
+
         // Create final certificate
         let certificate = Certificate {
             tbs_certificate: tbs_cert,
             signature_algorithm: rsa_with_sha256_algorithm_identifier(),
-            signature: der::asn1::BitString::from_bytes(&signature)
-                .map_err(|e| CertMgtError::CertificateGenerationError(format!("Signature BitString creation failed: {}", e)))?,
+            signature: der::asn1::BitString::from_bytes(&signature).map_err(|e| {
+                CertMgtError::CertificateGenerationError(format!(
+                    "Signature BitString creation failed: {}",
+                    e
+                ))
+            })?,
         };
 
         // Encode to PEM
-        let cert_der = certificate.to_der()
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("Certificate encoding failed: {}", e)))?;
+        let cert_der = certificate.to_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!("Certificate encoding failed: {}", e))
+        })?;
         let cert_pem = pem_encode("CERTIFICATE", &cert_der);
 
-        let key_der = existing_private_key.to_pkcs8_der()
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("Private key encoding failed: {}", e)))?;
+        let key_der = existing_private_key.to_pkcs8_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!("Private key encoding failed: {}", e))
+        })?;
         let key_pem = pem_encode("PRIVATE KEY", key_der.as_bytes());
 
         Ok(CertificateConfig {
@@ -548,13 +601,19 @@ impl CertificateConfig {
     // Helper methods
     fn extract_private_key_rsa(&self) -> Result<RsaPrivateKey, CertMgtError> {
         match &self.cert_data {
-            CertData::Pem { key: Some(key_pem), .. } => {
-                let key_der = pem_decode(key_pem)
-                    .map_err(|e| CertMgtError::InvalidConfiguration(format!("PEM decode failed: {}", e)))?;
-                RsaPrivateKey::from_pkcs8_der(&key_der)
-                    .map_err(|e| CertMgtError::InvalidConfiguration(format!("Private key parsing failed: {}", e)))
+            CertData::Pem {
+                key: Some(key_pem), ..
+            } => {
+                let key_der = pem_decode(key_pem).map_err(|e| {
+                    CertMgtError::InvalidConfiguration(format!("PEM decode failed: {}", e))
+                })?;
+                RsaPrivateKey::from_pkcs8_der(&key_der).map_err(|e| {
+                    CertMgtError::InvalidConfiguration(format!("Private key parsing failed: {}", e))
+                })
             }
-            _ => Err(CertMgtError::InvalidConfiguration("No private key available".to_string())),
+            _ => Err(CertMgtError::InvalidConfiguration(
+                "No private key available".to_string(),
+            )),
         }
     }
     pub fn matches_key_file(&self, key_path: &Path) -> bool {
@@ -604,7 +663,10 @@ impl CertificateConfig {
         let key_str = std::str::from_utf8(&bytes)?;
 
         match &mut self.cert_data {
-            CertData::Pem { cert, key: existing_key } => {
+            CertData::Pem {
+                cert,
+                key: existing_key,
+            } => {
                 if existing_key.is_some() {
                     eprintln!("Certificate already has a key attached. Overwriting.");
                 }
@@ -619,7 +681,6 @@ impl CertificateConfig {
 
         Ok(())
     }
-
 
     fn extract_ca_private_key(&self) -> Result<RsaPrivateKey, CertMgtError> {
         self.extract_private_key_rsa()
@@ -654,18 +715,19 @@ impl CertificateConfig {
         match &self.cert_data {
             CertData::Pem { cert, .. } => {
                 // Parse the PEM first
-                let pem = parse(cert)
-                    .map_err(|e| CertMgtError::InvalidConfiguration(format!("Invalid PEM format: {}", e)))?;
+                let pem = parse(cert).map_err(|e| {
+                    CertMgtError::InvalidConfiguration(format!("Invalid PEM format: {}", e))
+                })?;
 
                 // Then parse the certificate
-                let (_remainder, _cert) = X509Certificate::from_der(&pem.contents())
-                    .map_err(|e| CertMgtError::InvalidConfiguration(format!("Invalid certificate: {}", e)))?;
+                let (_remainder, _cert) =
+                    X509Certificate::from_der(&pem.contents()).map_err(|e| {
+                        CertMgtError::InvalidConfiguration(format!("Invalid certificate: {}", e))
+                    })?;
 
                 Ok(())
             }
-            CertData::P12 { .. } => {
-                Ok(())
-            }
+            CertData::P12 { .. } => Ok(()),
         }
     }
 
@@ -682,49 +744,61 @@ impl CertificateConfig {
                 }
                 Ok(pem_content)
             }
-            _ => Err(CertMgtError::UnsupportedCertFormat("Certificate is not in PEM format".to_string())),
+            _ => Err(CertMgtError::UnsupportedCertFormat(
+                "Certificate is not in PEM format".to_string(),
+            )),
         }
     }
 
     /// Check if certificate has a private key
     pub fn has_private_key(&self) -> bool {
         match &self.cert_data {
-            CertData::Pem { key: Some(key_data), .. } => !key_data.is_empty(),
+            CertData::Pem {
+                key: Some(key_data),
+                ..
+            } => !key_data.is_empty(),
             CertData::P12 { .. } => true, // P12 always contains private key
             _ => false,
         }
     }
 
-}
-
 // Utility functions that work with collections of CertificateConfig
-impl CertificateConfig {
     /// Find CA certificate from a collection
     pub fn find_ca(certificates: &[CertificateConfig]) -> Option<&CertificateConfig> {
         certificates.iter().find(|cert| cert.is_ca)
     }
 
     /// Find certificates expiring within threshold days
-    pub fn find_expiring(certificates: &[CertificateConfig], threshold_days: u32) -> Vec<&CertificateConfig> {
-        certificates.iter()
+    pub fn find_expiring(
+        certificates: &[CertificateConfig],
+        threshold_days: u32,
+    ) -> Vec<&CertificateConfig> {
+        certificates
+            .iter()
             .filter(|cert| cert.needs_renewal(threshold_days))
             .collect()
     }
 
     /// Find certificate by common name
-    pub fn find_by_common_name<'a>(certificates: &'a [CertificateConfig], common_name: &str) -> Option<&'a CertificateConfig> {
-        certificates.iter().find(|cert| cert.common_name == common_name)
+    pub fn find_by_common_name<'a>(
+        certificates: &'a [CertificateConfig],
+        common_name: &str,
+    ) -> Option<&'a CertificateConfig> {
+        certificates
+            .iter()
+            .find(|cert| cert.common_name == common_name)
     }
 
     /// Get next serial number from existing certificates
     pub fn get_next_serial(certificates: &[CertificateConfig]) -> u64 {
-        certificates.iter()
+        certificates
+            .iter()
             .filter_map(|cert| cert.serial_number.parse::<u64>().ok())
             .max()
-            .unwrap_or(0) + 1
+            .unwrap_or(0)
+            + 1
     }
 }
-
 
 fn create_distinguished_name(
     common_name: &str,
@@ -732,7 +806,7 @@ fn create_distinguished_name(
     state: &str,
     country: &str,
 ) -> Result<Name, CertMgtError> {
-    use der::{asn1::PrintableString, Encode, asn1::SetOfVec};
+    use der::{Encode, asn1::PrintableString, asn1::SetOfVec};
 
     let mut rdn_sequence = Vec::new();
 
@@ -740,15 +814,18 @@ fn create_distinguished_name(
     if !country.is_empty() {
         let country_value = PrintableString::new(country)
             .map_err(|e| CertMgtError::CaGenerationError(format!("Invalid country name: {}", e)))?;
-        let country_bytes = country_value.to_der()
-            .map_err(|e| CertMgtError::CaGenerationError(format!("Country encoding failed: {}", e)))?;
+        let country_bytes = country_value.to_der().map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Country encoding failed: {}", e))
+        })?;
         let country_attr = AttributeTypeAndValue {
             oid: const_oid::db::rfc4519::C,
-            value: der::Any::from_der(&country_bytes)
-                .map_err(|e| CertMgtError::CaGenerationError(format!("Country value creation failed: {}", e)))?,
+            value: der::Any::from_der(&country_bytes).map_err(|e| {
+                CertMgtError::CaGenerationError(format!("Country value creation failed: {}", e))
+            })?,
         };
-        let country_set = SetOfVec::try_from(vec![country_attr])
-            .map_err(|e| CertMgtError::CaGenerationError(format!("Country RDN creation failed: {}", e)))?;
+        let country_set = SetOfVec::try_from(vec![country_attr]).map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Country RDN creation failed: {}", e))
+        })?;
         rdn_sequence.push(RelativeDistinguishedName::from(country_set));
     }
 
@@ -756,46 +833,59 @@ fn create_distinguished_name(
     if !state.is_empty() {
         let state_value = PrintableString::new(state)
             .map_err(|e| CertMgtError::CaGenerationError(format!("Invalid state name: {}", e)))?;
-        let state_bytes = state_value.to_der()
-            .map_err(|e| CertMgtError::CaGenerationError(format!("State encoding failed: {}", e)))?;
+        let state_bytes = state_value.to_der().map_err(|e| {
+            CertMgtError::CaGenerationError(format!("State encoding failed: {}", e))
+        })?;
         let state_attr = AttributeTypeAndValue {
             oid: const_oid::db::rfc4519::ST,
-            value: der::Any::from_der(&state_bytes)
-                .map_err(|e| CertMgtError::CaGenerationError(format!("State value creation failed: {}", e)))?,
+            value: der::Any::from_der(&state_bytes).map_err(|e| {
+                CertMgtError::CaGenerationError(format!("State value creation failed: {}", e))
+            })?,
         };
-        let state_set = SetOfVec::try_from(vec![state_attr])
-            .map_err(|e| CertMgtError::CaGenerationError(format!("State RDN creation failed: {}", e)))?;
+        let state_set = SetOfVec::try_from(vec![state_attr]).map_err(|e| {
+            CertMgtError::CaGenerationError(format!("State RDN creation failed: {}", e))
+        })?;
         rdn_sequence.push(RelativeDistinguishedName::from(state_set));
     }
 
     // Organization
     if !organization.is_empty() {
-        let org_value = PrintableString::new(organization)
-            .map_err(|e| CertMgtError::CaGenerationError(format!("Invalid organization name: {}", e)))?;
-        let org_bytes = org_value.to_der()
-            .map_err(|e| CertMgtError::CaGenerationError(format!("Organization encoding failed: {}", e)))?;
+        let org_value = PrintableString::new(organization).map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Invalid organization name: {}", e))
+        })?;
+        let org_bytes = org_value.to_der().map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Organization encoding failed: {}", e))
+        })?;
         let org_attr = AttributeTypeAndValue {
             oid: const_oid::db::rfc4519::O,
-            value: der::Any::from_der(&org_bytes)
-                .map_err(|e| CertMgtError::CaGenerationError(format!("Organization value creation failed: {}", e)))?,
+            value: der::Any::from_der(&org_bytes).map_err(|e| {
+                CertMgtError::CaGenerationError(format!(
+                    "Organization value creation failed: {}",
+                    e
+                ))
+            })?,
         };
-        let org_set = SetOfVec::try_from(vec![org_attr])
-            .map_err(|e| CertMgtError::CaGenerationError(format!("Organization RDN creation failed: {}", e)))?;
+        let org_set = SetOfVec::try_from(vec![org_attr]).map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Organization RDN creation failed: {}", e))
+        })?;
         rdn_sequence.push(RelativeDistinguishedName::from(org_set));
     }
 
     // Common Name
     let cn_value = PrintableString::new(common_name)
         .map_err(|e| CertMgtError::CaGenerationError(format!("Invalid common name: {}", e)))?;
-    let cn_bytes = cn_value.to_der()
-        .map_err(|e| CertMgtError::CaGenerationError(format!("Common name encoding failed: {}", e)))?;
+    let cn_bytes = cn_value.to_der().map_err(|e| {
+        CertMgtError::CaGenerationError(format!("Common name encoding failed: {}", e))
+    })?;
     let cn_attr = AttributeTypeAndValue {
         oid: const_oid::db::rfc4519::CN,
-        value: der::Any::from_der(&cn_bytes)
-            .map_err(|e| CertMgtError::CaGenerationError(format!("Common name value creation failed: {}", e)))?,
+        value: der::Any::from_der(&cn_bytes).map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Common name value creation failed: {}", e))
+        })?,
     };
-    let cn_set = SetOfVec::try_from(vec![cn_attr])
-        .map_err(|e| CertMgtError::CaGenerationError(format!("Common name RDN creation failed: {}", e)))?;
+    let cn_set = SetOfVec::try_from(vec![cn_attr]).map_err(|e| {
+        CertMgtError::CaGenerationError(format!("Common name RDN creation failed: {}", e))
+    })?;
     rdn_sequence.push(RelativeDistinguishedName::from(cn_set));
 
     Ok(Name::from(rdn_sequence))
@@ -812,10 +902,15 @@ fn create_ca_extensions() -> Result<Extensions, CertMgtError> {
     extensions.push(Extension {
         extn_id: const_oid::db::rfc5280::ID_CE_BASIC_CONSTRAINTS,
         critical: true,
-        extn_value: der::asn1::OctetString::new(
-            &*basic_constraints.to_der()
-                .map_err(|e| CertMgtError::CaGenerationError(format!("Basic constraints encoding failed: {}", e)))?
-        ).map_err(|e| CertMgtError::CaGenerationError(format!("Basic constraints OctetString creation failed: {}", e)))?,
+        extn_value: der::asn1::OctetString::new(&*basic_constraints.to_der().map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Basic constraints encoding failed: {}", e))
+        })?)
+        .map_err(|e| {
+            CertMgtError::CaGenerationError(format!(
+                "Basic constraints OctetString creation failed: {}",
+                e
+            ))
+        })?,
     });
 
     // Key Usage
@@ -823,15 +918,16 @@ fn create_ca_extensions() -> Result<Extensions, CertMgtError> {
     extensions.push(Extension {
         extn_id: const_oid::db::rfc5280::ID_CE_KEY_USAGE,
         critical: true,
-        extn_value: der::asn1::OctetString::new(
-            &*key_usage.to_der()
-                .map_err(|e| CertMgtError::CaGenerationError(format!("Key usage encoding failed: {}", e)))?
-        ).map_err(|e| CertMgtError::CaGenerationError(format!("Key usage OctetString creation failed: {}", e)))?,
+        extn_value: der::asn1::OctetString::new(&*key_usage.to_der().map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Key usage encoding failed: {}", e))
+        })?)
+        .map_err(|e| {
+            CertMgtError::CaGenerationError(format!("Key usage OctetString creation failed: {}", e))
+        })?,
     });
 
     Ok(Extensions::from(extensions))
 }
-
 
 fn create_server_extensions(
     alt_names: &[String],
@@ -847,10 +943,18 @@ fn create_server_extensions(
     extensions.push(Extension {
         extn_id: const_oid::db::rfc5280::ID_CE_BASIC_CONSTRAINTS,
         critical: true,
-        extn_value: der::asn1::OctetString::new(
-            &*basic_constraints.to_der()
-                .map_err(|e| CertMgtError::CertificateGenerationError(format!("Basic constraints encoding failed: {}", e)))?
-        ).map_err(|e| CertMgtError::CertificateGenerationError(format!("Basic constraints OctetString creation failed: {}", e)))?,
+        extn_value: der::asn1::OctetString::new(&*basic_constraints.to_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!(
+                "Basic constraints encoding failed: {}",
+                e
+            ))
+        })?)
+        .map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!(
+                "Basic constraints OctetString creation failed: {}",
+                e
+            ))
+        })?,
     });
 
     // Key Usage
@@ -858,10 +962,15 @@ fn create_server_extensions(
     extensions.push(Extension {
         extn_id: const_oid::db::rfc5280::ID_CE_KEY_USAGE,
         critical: true,
-        extn_value: der::asn1::OctetString::new(
-            &*key_usage.to_der()
-                .map_err(|e| CertMgtError::CertificateGenerationError(format!("Key usage encoding failed: {}", e)))?
-        ).map_err(|e| CertMgtError::CertificateGenerationError(format!("Key usage OctetString creation failed: {}", e)))?,
+        extn_value: der::asn1::OctetString::new(&*key_usage.to_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!("Key usage encoding failed: {}", e))
+        })?)
+        .map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!(
+                "Key usage OctetString creation failed: {}",
+                e
+            ))
+        })?,
     });
 
     // Extended Key Usage
@@ -869,10 +978,18 @@ fn create_server_extensions(
     extensions.push(Extension {
         extn_id: const_oid::db::rfc5280::ID_CE_EXT_KEY_USAGE,
         critical: false,
-        extn_value: der::asn1::OctetString::new(
-            &*ext_key_usage.to_der()
-                .map_err(|e| CertMgtError::CertificateGenerationError(format!("Extended key usage encoding failed: {}", e)))?
-        ).map_err(|e| CertMgtError::CertificateGenerationError(format!("Extended key usage OctetString creation failed: {}", e)))?,
+        extn_value: der::asn1::OctetString::new(&*ext_key_usage.to_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!(
+                "Extended key usage encoding failed: {}",
+                e
+            ))
+        })?)
+        .map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!(
+                "Extended key usage OctetString creation failed: {}",
+                e
+            ))
+        })?,
     });
 
     // Subject Alternative Name
@@ -885,51 +1002,73 @@ fn create_server_extensions(
                     IpAddr::V6(ipv6) => ipv6.octets().to_vec(),
                 };
                 san_names.push(x509_cert::ext::pkix::name::GeneralName::IpAddress(
-                    der::asn1::OctetString::new(&*ip_bytes)
-                        .map_err(|e| CertMgtError::CertificateGenerationError(format!("IP address OctetString creation failed: {}", e)))?
+                    der::asn1::OctetString::new(&*ip_bytes).map_err(|e| {
+                        CertMgtError::CertificateGenerationError(format!(
+                            "IP address OctetString creation failed: {}",
+                            e
+                        ))
+                    })?,
                 ));
             } else {
-                let ia5_string = der::asn1::Ia5String::new(name)
-                    .map_err(|e| CertMgtError::CertificateGenerationError(format!("Invalid DNS name: {}", e)))?;
+                let ia5_string = der::asn1::Ia5String::new(name).map_err(|e| {
+                    CertMgtError::CertificateGenerationError(format!("Invalid DNS name: {}", e))
+                })?;
                 san_names.push(x509_cert::ext::pkix::name::GeneralName::DnsName(ia5_string));
             }
         }
-        
+
         let subject_alt_name = SubjectAltName(san_names);
         extensions.push(Extension {
             extn_id: const_oid::db::rfc5280::ID_CE_SUBJECT_ALT_NAME,
             critical: false,
-            extn_value: der::asn1::OctetString::new(
-                &*subject_alt_name.to_der()
-                    .map_err(|e| CertMgtError::CertificateGenerationError(format!("SAN encoding failed: {}", e)))?
-            ).map_err(|e| CertMgtError::CertificateGenerationError(format!("SAN OctetString creation failed: {}", e)))?,
+            extn_value: der::asn1::OctetString::new(&*subject_alt_name.to_der().map_err(|e| {
+                CertMgtError::CertificateGenerationError(format!("SAN encoding failed: {}", e))
+            })?)
+            .map_err(|e| {
+                CertMgtError::CertificateGenerationError(format!(
+                    "SAN OctetString creation failed: {}",
+                    e
+                ))
+            })?,
         });
     }
 
     // Authority Key Identifier
-    let ca_public_key_der = ca_public_key.to_public_key_der()
-        .map_err(|e| CertMgtError::CertificateGenerationError(format!("CA public key encoding failed: {}", e)))?;
+    let ca_public_key_der = ca_public_key.to_public_key_der().map_err(|e| {
+        CertMgtError::CertificateGenerationError(format!("CA public key encoding failed: {}", e))
+    })?;
     let key_id = sha1_hash((&ca_public_key_der).as_ref());
-    
+
     let authority_key_id = AuthorityKeyIdentifier {
-        key_identifier: Some(der::asn1::OctetString::new(&key_id)
-            .map_err(|e| CertMgtError::CertificateGenerationError(format!("Key ID OctetString creation failed: {}", e)))?),
+        key_identifier: Some(der::asn1::OctetString::new(&key_id).map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!(
+                "Key ID OctetString creation failed: {}",
+                e
+            ))
+        })?),
         authority_cert_issuer: None,
         authority_cert_serial_number: None,
     };
-    
+
     extensions.push(Extension {
         extn_id: const_oid::db::rfc5280::ID_CE_AUTHORITY_KEY_IDENTIFIER,
         critical: false,
-        extn_value: der::asn1::OctetString::new(
-            &*authority_key_id.to_der()
-                .map_err(|e| CertMgtError::CertificateGenerationError(format!("Authority key ID encoding failed: {}", e)))?
-        ).map_err(|e| CertMgtError::CertificateGenerationError(format!("Authority key ID OctetString creation failed: {}", e)))?,
+        extn_value: der::asn1::OctetString::new(&*authority_key_id.to_der().map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!(
+                "Authority key ID encoding failed: {}",
+                e
+            ))
+        })?)
+        .map_err(|e| {
+            CertMgtError::CertificateGenerationError(format!(
+                "Authority key ID OctetString creation failed: {}",
+                e
+            ))
+        })?,
     });
 
     Ok(Extensions::from(extensions))
 }
-
 
 fn rsa_with_sha256_algorithm_identifier() -> AlgorithmIdentifier<Any> {
     AlgorithmIdentifier {
@@ -940,23 +1079,31 @@ fn rsa_with_sha256_algorithm_identifier() -> AlgorithmIdentifier<Any> {
 fn pem_encode(label: &str, data: &[u8]) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     let encoded = STANDARD.encode(data);
-    format!("-----BEGIN {}-----\n{}\n-----END {}-----\n",
-            label,
-            encoded.chars().collect::<Vec<_>>()
-                .chunks(64)
-                .map(|chunk| chunk.iter().collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            label)
+    format!(
+        "-----BEGIN {}-----\n{}\n-----END {}-----\n",
+        label,
+        encoded
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(64)
+            .map(|chunk| chunk.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        label
+    )
 }
 
 fn pem_decode(pem: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     let lines: Vec<&str> = pem.lines().collect();
-    let start_idx = lines.iter().position(|&line| line.starts_with("-----BEGIN"))
+    let start_idx = lines
+        .iter()
+        .position(|&line| line.starts_with("-----BEGIN"))
         .ok_or("No PEM begin marker found")?;
-    let end_idx = lines.iter().position(|&line| line.starts_with("-----END"))
+    let end_idx = lines
+        .iter()
+        .position(|&line| line.starts_with("-----END"))
         .ok_or("No PEM end marker found")?;
 
     let base64_data = lines[start_idx + 1..end_idx].join("");
@@ -964,35 +1111,38 @@ fn pem_decode(pem: &str) -> Result<Vec<u8>, Box<dyn Error>> {
 }
 
 fn sha1_hash(data: &[u8]) -> [u8; 20] {
-    use sha1::{Sha1, Digest};
+    use sha1::{Digest, Sha1};
     let mut hasher = Sha1::new();
     hasher.update(data);
     hasher.finalize().into()
 }
 
-
 fn get_subject_attr(parsed: &X509Certificate, oid: Oid) -> String {
-    parsed.subject().iter_by_oid(&oid)
+    parsed
+        .subject()
+        .iter_by_oid(&oid)
         .next()
         .and_then(|attr| attr.as_str().ok())
         .map(|s| s.to_owned())
         .unwrap_or_default()
-
 }
 
 fn get_key_size(cert: &X509Certificate) -> Option<usize> {
     cert.subject_pki
         .parsed()
         .map(|pk| match pk {
-            PublicKey::RSA(rsa) => rsa.key_size(),       // RSA: bits in modulus
-            PublicKey::EC(ec)   => ec.key_size(),        // EC: curve size
-            PublicKey::DSA(buf) => 8 * buf.len(),        // DSA: parameter length
+            PublicKey::RSA(rsa) => rsa.key_size(), // RSA: bits in modulus
+            PublicKey::EC(ec) => ec.key_size(),    // EC: curve size
+            PublicKey::DSA(buf) => 8 * buf.len(),  // DSA: parameter length
             _ => 0,
         })
         .ok()
         .filter(|&bits| bits > 0)
 }
-fn get_cert_info(cert: X509Certificate, cert_data: CertData) -> Result<CertificateConfig, Box<dyn Error>> {
+fn get_cert_info(
+    cert: X509Certificate,
+    cert_data: CertData,
+) -> Result<CertificateConfig, Box<dyn Error>> {
     let serial_number = cert.serial.to_string();
     let is_ca = cert.is_ca();
     let not_after = asn1_time_to_timestamp(&cert.validity.not_after);
@@ -1022,10 +1172,7 @@ fn get_cert_info(cert: X509Certificate, cert_data: CertData) -> Result<Certifica
     Ok(cert)
 }
 
-fn sign_with_rsa_sha256(
-    private_key: &RsaPrivateKey,
-    data: &[u8],
-) -> Result<Vec<u8>, CertMgtError> {
+fn sign_with_rsa_sha256(private_key: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>, CertMgtError> {
     let signing_key = SigningKey::<Sha256>::new(private_key.clone());
     let signature = signing_key.sign(data); // Automatically hashes & signs
     Ok(signature.to_bytes().to_vec())

@@ -1,10 +1,10 @@
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, io, path::PathBuf};
-use std::path::Path;
+use certmgt_lib::CertificateConfig;
 use dirs::home_dir;
 use rpassword::read_password;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::{collections::HashMap, fs, io, path::PathBuf};
 use toml::value::Time;
-use certmgt_lib::CertificateConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -33,15 +33,13 @@ pub struct TuiConfig {
 impl TuiConfig {
     pub fn p12_passwords_print(&self) -> String {
         match self.p12_passwords {
-            Some(PasswordSourceConfig::Map(ref map)) => {
-                map.iter().map(|(x, y)| format!("{}:{}", x, y)).collect::<Vec<_>>().join(",")
-            }
-            Some(PasswordSourceConfig::List(ref list)) => {
-                list.join(",")
-            },
-            None => {
-                String::from("")
-            }
+            Some(PasswordSourceConfig::Map(ref map)) => map
+                .iter()
+                .map(|(x, y)| format!("{}:{}", x, y))
+                .collect::<Vec<_>>()
+                .join(","),
+            Some(PasswordSourceConfig::List(ref list)) => list.join(","),
+            None => String::from(""),
         }
     }
 }
@@ -65,12 +63,10 @@ impl TuiConfig {
         if let Some(config_path) = Self::config_file_path() {
             if config_path.exists() {
                 match fs::read_to_string(&config_path) {
-                    Ok(content) => {
-                        match toml::from_str(&content) {
-                            Ok(config) => return config,
-                            Err(e) => eprintln!("Warning: Failed to parse config file: {}", e),
-                        }
-                    }
+                    Ok(content) => match toml::from_str(&content) {
+                        Ok(config) => return config,
+                        Err(e) => eprintln!("Warning: Failed to parse config file: {}", e),
+                    },
                     Err(e) => eprintln!("Warning: Failed to read config file: {}", e),
                 }
             }
@@ -105,10 +101,7 @@ impl TuiConfig {
     }
 
     /// Try to unlock a p12 using map first, then list, then prompt.
-    pub fn try_passwords_for_file(
-        &self,
-        file_path: &std::path::Path,
-    ) -> Option<CertificateConfig> {
+    pub fn try_passwords_for_file(&self, file_path: &std::path::Path) -> Option<CertificateConfig> {
         let file_name = file_path.file_name()?.to_string_lossy().to_string();
         eprintln!("DEBUG: Loaded p12_passwords = {:?}", self.p12_passwords);
         // 1. Try explicit map
@@ -118,7 +111,9 @@ impl TuiConfig {
                     CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(pw))
                 {
                     return Some(config);
-                } else { eprintln!("Warning: Failed to read config file: {}", file_name); }
+                } else {
+                    eprintln!("Warning: Failed to read config file: {}", file_name);
+                }
             }
         }
 
@@ -129,7 +124,9 @@ impl TuiConfig {
                     CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(pw))
                 {
                     return Some(config);
-                } else { eprintln!("Warning: Failed to read config file: {}", file_name); }
+                } else {
+                    eprintln!("Warning: Failed to read config file: {}", file_name);
+                }
             }
         }
 

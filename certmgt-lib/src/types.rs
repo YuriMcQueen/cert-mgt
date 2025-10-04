@@ -1,5 +1,5 @@
-use std::fmt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificateConfig {
@@ -42,7 +42,11 @@ impl fmt::Display for CertData {
                 }
                 Ok(())
             }
-            CertData::P12 { data, password, as_base64 } => {
+            CertData::P12 {
+                data,
+                password,
+                as_base64,
+            } => {
                 writeln!(f, "PKCS#12 certificate (as_base64={}):", as_base64)?;
                 writeln!(f, "{}", data.replace("\\n", "\n"))?;
                 writeln!(f, "Password: {}", password)?;

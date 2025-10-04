@@ -1,10 +1,33 @@
-use serde::{Deserialize, Serialize};
-use std::path::Path;
-use certmgt_lib::{CertData, CertMgtError, CertificateConfig};
-use flate2::{Compression, write::GzEncoder};
-use std::io::Write;
+use crate::{
+    cert_fingerprint, discover_cert_files, is_compressed_file, load_certificates_from_database,
+};
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
+use certmgt_lib::{CertData, CertMgtError, CertificateConfig};
+use flate2::{Compression, write::GzEncoder};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::io;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use crate::config::TuiConfig;
+use anyhow::{Result, Context};
+
+trait IntoCertConfigs {
+    fn into_configs(self, tui_config: TuiConfig) -> Result<Vec<CertificateConfig>>;
+}
+
+impl IntoCertConfigs for Vec<PathBuf> {
+    fn into_configs(self, tui_config: TuiConfig)-> Result<Vec<CertificateConfig>> {
+        discover_and_parse(self, &tui_config, None) // or pass password_file externally
+    }
+}
+
+impl IntoCertConfigs for Vec<CertificateConfig> {
+    fn into_configs(self, _tui_config: TuiConfig) -> Result<Vec<CertificateConfig>> {
+        Ok(self)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CertificateDatabase {
@@ -47,13 +70,224 @@ pub fn load_certificates_from_json(path: &Path) -> Result<Vec<CertificateConfig>
     let db: CertificateDatabase = serde_json::from_str(&content)?;
     Ok(db.certificates)
 }
+pub fn import<T: IntoCertConfigs>(
+    tui_config: &TuiConfig,
+    inputs: T,
+    database: PathBuf,
+    compressed: bool,
+    force: bool,
+    password_file: Option<PathBuf>,
+) -> Result<()> {
+    let mut final_configs = load_existing_database(&database)?;
+    let mut seen: HashSet<String> =
+        final_configs.iter().map(|c| cert_fingerprint(&c.cert_data)).collect();
+
+    let new_configs = inputs.into_configs(tui_config.clone())
+        .map_err(anyhow::Error::from)?;
+
+    let (imported, skipped, overridden) =
+        merge_configs(new_configs, &mut final_configs, &mut seen, force);
+
+    save_database(&database, compressed, final_configs)?;
+    println!(
+        "✅ Import complete: {} new, {} skipped, {} overridden",
+        imported, skipped, overridden
+    );
+    Ok(())
+}
+
+
+fn load_existing_database(database: &PathBuf) -> Result<Vec<CertificateConfig>> {
+    if database.exists() {
+        match load_certificates_from_database(database) {
+            Ok(existing) => {
+                println!("Found {} existing certificates in database", existing.len());
+                Ok(existing)
+            }
+            Err(e) => {
+                eprintln!("Error reading existing database: {}", e);
+                Err(e.into())
+            }
+        }
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn discover_and_parse(
+    inputs: Vec<PathBuf>,
+    tui_config: &TuiConfig,
+    password_file: Option<PathBuf>,
+) -> Result<Vec<CertificateConfig>> {
+    let mut configs = Vec::new();
+    for p in inputs {
+        let discovered_files = discover_cert_files(&p);
+        if discovered_files.is_empty() {
+            eprintln!("No certificates found in {}", p.display());
+            continue;
+        }
+        println!("Found {} certificates in {}", discovered_files.len(), p.display());
+
+        for file_path in discovered_files {
+            if let Some(config) = parse_certificate_file(&file_path, tui_config, password_file.as_ref().map(|p| p.as_path())) {
+                configs.push(config);
+            }
+        }
+    }
+    Ok(configs)
+}
+
+fn parse_certificate_file(
+    file_path: &Path,
+    tui_config: &TuiConfig,
+    password_file: Option<&Path>,
+) -> Option<CertificateConfig> {
+    loop {
+        match CertificateConfig::read_from_path(file_path.to_str().unwrap_or_default(), None) {
+            Ok(config) => return Some(config),
+
+            // Handle password-protected P12
+            Err(e) if e.to_string().contains("requires a password") => {
+                if let Some(config) = try_with_passwords(tui_config, file_path, password_file) {
+                    return Some(config);
+                }
+
+                // Interactive fallback
+                eprintln!("P12 file {} requires a password.", file_path.display());
+                eprint!("Enter password: ");
+                io::stdout().flush().ok()?;
+                let password = rpassword::read_password().ok()?;
+                if let Ok(config) =
+                    CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password))
+                {
+                    return Some(config);
+                } else {
+                    eprintln!("Password did not work for {}", file_path.display());
+                    return None;
+                }
+            }
+
+            // Handle PEM key-only file
+            Err(e) if e.to_string().contains("PEM file contains only private key") => {
+                return match find_and_attach_matching_cert(file_path) {
+                    Ok(config) => Some(config),
+                    Err(e) => {
+                        eprintln!("Error resolving PEM key {}: {}", file_path.display(), e);
+                        None
+                    }
+                };
+            }
+
+            Err(e) => {
+                eprintln!("Error reading {}: {}", file_path.display(), e);
+                return None;
+            }
+        }
+    }
+}
+
+
+fn try_with_passwords(
+    tui_config: &TuiConfig,
+    file_path: &Path,
+    password_file: Option<&Path>,
+) -> Option<CertificateConfig> {
+    // 1. Config-driven passwords from TuiConfig
+    if let Some(configured) = tui_config.try_passwords_for_file(file_path) {
+        return Some(configured);
+    }
+
+    // 2. Password file fallback
+    if let Some(pf) = password_file {
+        if let Ok(password) = std::fs::read_to_string(pf) {
+            if let Ok(config) = CertificateConfig::read_from_path(
+                file_path.to_str().unwrap(),
+                Some(password.trim()),
+            ) {
+                return Some(config);
+            }
+        }
+    }
+
+    None
+}
+
+
+fn find_and_attach_matching_cert(
+    file_path: &Path,
+) -> Result<CertificateConfig, Box<dyn std::error::Error>> {
+    let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
+    let candidates = discover_cert_files(dir);
+
+    let matching_cert_path = candidates
+        .into_iter()
+        .filter(|p| *p != file_path)
+        .find(|p| {
+            CertificateConfig::read_from_path(p.to_str().unwrap(), None)
+                .map(|c| c.matches_key_file(file_path))
+                .unwrap_or(false)
+        });
+
+    if let Some(cert_path) = matching_cert_path {
+        let mut cert_config = CertificateConfig::read_from_path(cert_path.to_str().unwrap(), None)?;
+        cert_config.attach_key_from_file(file_path, None)?;
+        Ok(cert_config)
+    } else {
+        Err(format!("No matching certificate found for key {}", file_path.display()).into())
+    }
+}
+
+fn merge_configs(
+    new_configs: Vec<CertificateConfig>,
+    final_configs: &mut Vec<CertificateConfig>,
+    seen: &mut HashSet<String>,
+    force: bool,
+) -> (usize, usize, usize) {
+    let mut imported = 0;
+    let mut skipped = 0;
+    let mut overridden = 0;
+
+    for config in new_configs {
+        let fp = cert_fingerprint(&config.cert_data);
+        if seen.contains(&fp) {
+            if force {
+                println!("Overriding duplicate: {}", config.common_name);
+                overridden += 1;
+                final_configs.retain(|c| cert_fingerprint(&c.cert_data) != fp);
+            } else {
+                println!("Skipping duplicate: {}", config.common_name);
+                skipped += 1;
+                continue;
+            }
+        } else {
+            imported += 1;
+        }
+        seen.insert(fp);
+        final_configs.push(config);
+    }
+
+    (imported, skipped, overridden)
+}
+
+fn save_database(
+    database: &PathBuf,
+    compressed: bool,
+    configs: Vec<CertificateConfig>,
+) -> Result<()> {
+    let use_compression = compressed || is_compressed_file(database);
+    if use_compression {
+        save_certificates_to_json_compressed(configs, database)?;
+    } else {
+        save_certificates_to_json(configs, database)?;
+    }
+    Ok(())
+}
 
 // Compressed JSON variant (if you need smaller files)
 pub fn save_certificates_to_json_compressed(
     configs: Vec<CertificateConfig>,
     path: &Path,
 ) -> Result<(), CertMgtError> {
-
     let db = CertificateDatabase::with_certificates(configs);
     let json = serde_json::to_string(&db)?; // No pretty printing for compression
 
@@ -84,8 +318,6 @@ pub fn export_certificate(
     config: &CertificateConfig,
     output_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
-
     match &config.cert_data {
         CertData::Pem { cert, key } => {
             // Export as PEM file - combine cert and key if both exist
@@ -266,24 +498,24 @@ fn validate_private_key(key_content: &str, password: Option<&str>) -> Result<(),
         "DSA PRIVATE KEY",
     ];
 
-    let has_private_key = pem_blocks.iter().any(|block| {
-        private_key_tags.contains(&block.tag())
-    });
+    let has_private_key = pem_blocks
+        .iter()
+        .any(|block| private_key_tags.contains(&block.tag()));
 
     if !has_private_key {
         return Err(CertMgtError::InvalidPrivateKey(
-            "No private key found in PEM data".to_string()
+            "No private key found in PEM data".to_string(),
         ));
     }
 
     // Check for encrypted keys when no password provided
-    let has_encrypted_key = pem_blocks.iter().any(|block| {
-        block.tag() == "ENCRYPTED PRIVATE KEY"
-    });
+    let has_encrypted_key = pem_blocks
+        .iter()
+        .any(|block| block.tag() == "ENCRYPTED PRIVATE KEY");
 
     if has_encrypted_key && password.is_none() {
         return Err(CertMgtError::InvalidPrivateKey(
-            "Encrypted private key requires password".to_string()
+            "Encrypted private key requires password".to_string(),
         ));
     }
 

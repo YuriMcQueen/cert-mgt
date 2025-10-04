@@ -23,7 +23,10 @@ pub fn detect_cert_type(bytes: &[u8]) -> Result<CertDataType, Box<dyn Error>> {
         }
 
         let filtered: String = content.chars().filter(|c| !c.is_whitespace()).collect();
-        if filtered.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)) {
+        if filtered
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
+        {
             if let Ok(decoded) = BASE64_STANDARD.decode(&filtered) {
                 if decoded.starts_with(&[0x30]) {
                     return Ok(CertDataType::P12 { as_base64: true });

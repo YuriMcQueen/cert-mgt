@@ -1,6 +1,4 @@
-use crate::{
-    CertData, CertMgtError, CertificateConfig,
-};
+use crate::{CertData, CertMgtError, CertificateConfig};
 use std::str::FromStr;
 
 // Filter operations
@@ -241,7 +239,6 @@ pub fn filter_certificates(
     filters: Vec<String>,
     use_or_logic: bool,
 ) -> Result<Vec<CertificateConfig>, CertMgtError> {
-
     if filters.is_empty() {
         return Ok(certificates);
     }
@@ -263,7 +260,9 @@ pub fn filter_certificates_simple(
 }
 
 // Updated versions of your existing functions using the new filter system
-pub fn list_certificates_without_keys(certificates: Vec<CertificateConfig>) -> Result<Vec<String>, CertMgtError> {
+pub fn list_certificates_without_keys(
+    certificates: Vec<CertificateConfig>,
+) -> Result<Vec<String>, CertMgtError> {
     let filtered = filter_certificates_simple(certificates, "has_private_key==false")?;
     Ok(filtered
         .into_iter()
@@ -291,14 +290,15 @@ pub fn find_expiring_certificates(
 ) -> Result<Vec<CertificateConfig>, CertMgtError> {
     let threshold = chrono::Utc::now().timestamp() + (days_ahead * 24 * 60 * 60);
 
-
     Ok(certificates
         .into_iter()
         .filter(|config| config.not_after <= threshold && config.not_after > 0)
         .collect())
 }
 
-pub fn find_ca_certificates(certificates: Vec<CertificateConfig>) -> Result<Vec<CertificateConfig>, CertMgtError> {
+pub fn find_ca_certificates(
+    certificates: Vec<CertificateConfig>,
+) -> Result<Vec<CertificateConfig>, CertMgtError> {
     filter_certificates_simple(certificates, "is_ca==true")
 }
 
