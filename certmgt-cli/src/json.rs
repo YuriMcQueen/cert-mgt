@@ -11,20 +11,20 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use crate::config::TuiConfig;
-use anyhow::{Result, Context};
+use anyhow::Result;
 
 trait IntoCertConfigs {
-    fn into_configs(self, tui_config: TuiConfig) -> Result<Vec<CertificateConfig>>;
+    fn into_configs(self, tui_config: TuiConfig, prints: bool) -> Result<Vec<CertificateConfig>>;
 }
 
 impl IntoCertConfigs for Vec<PathBuf> {
-    fn into_configs(self, tui_config: TuiConfig)-> Result<Vec<CertificateConfig>> {
-        discover_and_parse(self, &tui_config, None) // or pass password_file externally
+    fn into_configs(self, tui_config: TuiConfig, prints: bool)-> Result<Vec<CertificateConfig>> {
+        discover_and_parse(self, &tui_config, None, prints) // or pass password_file externally
     }
 }
 
 impl IntoCertConfigs for Vec<CertificateConfig> {
-    fn into_configs(self, _tui_config: TuiConfig) -> Result<Vec<CertificateConfig>> {
+    fn into_configs(self, _tui_config: TuiConfig, _prints: bool) -> Result<Vec<CertificateConfig>> {
         Ok(self)
     }
 }
@@ -77,35 +77,43 @@ pub fn import<T: IntoCertConfigs>(
     compressed: bool,
     force: bool,
     password_file: Option<PathBuf>,
+    prints: bool,
 ) -> Result<()> {
-    let mut final_configs = load_existing_database(&database)?;
+    let mut final_configs = load_existing_database(&database, prints)?;
     let mut seen: HashSet<String> =
         final_configs.iter().map(|c| cert_fingerprint(&c.cert_data)).collect();
 
-    let new_configs = inputs.into_configs(tui_config.clone())
+    let new_configs = inputs.into_configs(tui_config.clone(), prints)
         .map_err(anyhow::Error::from)?;
 
     let (imported, skipped, overridden) =
-        merge_configs(new_configs, &mut final_configs, &mut seen, force);
+        merge_configs(new_configs, &mut final_configs, &mut seen, force, prints);
 
     save_database(&database, compressed, final_configs)?;
-    println!(
-        "✅ Import complete: {} new, {} skipped, {} overridden",
-        imported, skipped, overridden
-    );
+    if prints{
+        println!(
+            "✅ Import complete: {} new, {} skipped, {} overridden",
+            imported, skipped, overridden
+        );
+    }
+
     Ok(())
 }
 
 
-fn load_existing_database(database: &PathBuf) -> Result<Vec<CertificateConfig>> {
+fn load_existing_database(database: &PathBuf, prints: bool) -> Result<Vec<CertificateConfig>> {
     if database.exists() {
         match load_certificates_from_database(database) {
             Ok(existing) => {
-                println!("Found {} existing certificates in database", existing.len());
+                if prints {
+                    println!("Found {} existing certificates in database", existing.len());
+                }
                 Ok(existing)
             }
             Err(e) => {
-                eprintln!("Error reading existing database: {}", e);
+                if prints {
+                    eprintln!("Error reading existing database: {}", e);
+                }
                 Err(e.into())
             }
         }
@@ -118,18 +126,23 @@ fn discover_and_parse(
     inputs: Vec<PathBuf>,
     tui_config: &TuiConfig,
     password_file: Option<PathBuf>,
+    prints: bool,
 ) -> Result<Vec<CertificateConfig>> {
     let mut configs = Vec::new();
     for p in inputs {
         let discovered_files = discover_cert_files(&p);
         if discovered_files.is_empty() {
-            eprintln!("No certificates found in {}", p.display());
+            if prints {
+                eprintln!("No certificates found in {}", p.display());
+            }
             continue;
         }
-        println!("Found {} certificates in {}", discovered_files.len(), p.display());
+        if prints {
+            println!("Found {} certificates in {}", discovered_files.len(), p.display());
+        }
 
         for file_path in discovered_files {
-            if let Some(config) = parse_certificate_file(&file_path, tui_config, password_file.as_ref().map(|p| p.as_path())) {
+            if let Some(config) = parse_certificate_file(&file_path, tui_config, password_file.as_ref().map(|p| p.as_path()), prints) {
                 configs.push(config);
             }
         }
@@ -141,6 +154,7 @@ fn parse_certificate_file(
     file_path: &Path,
     tui_config: &TuiConfig,
     password_file: Option<&Path>,
+    prints: bool,
 ) -> Option<CertificateConfig> {
     loop {
         match CertificateConfig::read_from_path(file_path.to_str().unwrap_or_default(), None) {
@@ -153,8 +167,10 @@ fn parse_certificate_file(
                 }
 
                 // Interactive fallback
-                eprintln!("P12 file {} requires a password.", file_path.display());
-                eprint!("Enter password: ");
+                if prints {
+                    eprintln!("P12 file {} requires a password.", file_path.display());
+                    eprint!("Enter password: ");
+                }
                 io::stdout().flush().ok()?;
                 let password = rpassword::read_password().ok()?;
                 if let Ok(config) =
@@ -162,7 +178,9 @@ fn parse_certificate_file(
                 {
                     return Some(config);
                 } else {
-                    eprintln!("Password did not work for {}", file_path.display());
+                    if prints {
+                        eprintln!("Password did not work for {}", file_path.display());
+                    }
                     return None;
                 }
             }
@@ -172,14 +190,18 @@ fn parse_certificate_file(
                 return match find_and_attach_matching_cert(file_path) {
                     Ok(config) => Some(config),
                     Err(e) => {
-                        eprintln!("Error resolving PEM key {}: {}", file_path.display(), e);
+                        if prints {
+                            eprintln!("Error resolving PEM key {}: {}", file_path.display(), e);
+                        }
                         None
                     }
                 };
             }
 
             Err(e) => {
-                eprintln!("Error reading {}: {}", file_path.display(), e);
+                if prints {
+                    eprintln!("Error reading {}: {}", file_path.display(), e);
+                }
                 return None;
             }
         }
@@ -242,6 +264,7 @@ fn merge_configs(
     final_configs: &mut Vec<CertificateConfig>,
     seen: &mut HashSet<String>,
     force: bool,
+    prints: bool,
 ) -> (usize, usize, usize) {
     let mut imported = 0;
     let mut skipped = 0;
@@ -251,11 +274,15 @@ fn merge_configs(
         let fp = cert_fingerprint(&config.cert_data);
         if seen.contains(&fp) {
             if force {
-                println!("Overriding duplicate: {}", config.common_name);
+                if prints {
+                    println!("Overriding duplicate: {}", config.common_name);
+                }
                 overridden += 1;
                 final_configs.retain(|c| cert_fingerprint(&c.cert_data) != fp);
             } else {
-                println!("Skipping duplicate: {}", config.common_name);
+                if prints {
+                    println!("Skipping duplicate: {}", config.common_name);
+                }
                 skipped += 1;
                 continue;
             }

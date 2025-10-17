@@ -25,6 +25,7 @@ use ratatui::layout::Margin;
 use ratatui::style::palette::material::GREEN;
 use ratatui::style::palette::tailwind::SLATE;
 use ratatui::widgets::ScrollbarState;
+use certmgt_lib::filters::FilterOp::Contains;
 
 const NORMAL_ROW_BG: Color = SLATE.c950;
 const ALT_ROW_BG_COLOR: Color = SLATE.c900;
@@ -683,7 +684,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                     KeyCode::Esc => app.show_ca_selector = false,
                     _ => {}
                 }
-
+                continue
             // Handle popup events first (highest priority)
             } else if app.show_generate_popup {
                 match key.code {
@@ -929,7 +930,7 @@ fn draw_setup_screen<B: Backend>(f: &mut Frame, app: &mut App) {
         Line::from(vec![Span::styled(
             "🔐 Certificate Management TUI 🔐",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::LightGreen)
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(""),
@@ -1278,7 +1279,6 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
          Is CA: {}\n\
          Key Size: {:?}\n\
          Has Private Key: {}\n\
-         \n\
          Valid From: {}\n\
          Valid Until: {}\n\
          Status: {}\n\
@@ -1444,17 +1444,6 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
 
     // Step 4: Generate CA (this might be where it freezes)
     app.status_message = "Generating CA certificate...".to_string();
-    // let ca_cert = match CertificateConfig::new_ca(ca_config) {
-    //     Ok(cert) => {
-    //         app.status_message = "CA certificate created successfully".to_string();
-    //         cert
-    //     }
-    //     Err(e) => {
-    //         app.status_message = format!("CA generation failed: {}", e);
-    //         app.cert_form = Some(form);
-    //         return;
-    //     }
-    // };
 
     // Step 5: Create server config
     app.status_message = "Creating server certificate configuration...".to_string();
@@ -1491,7 +1480,8 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
         database,
         false,
         true,
-        None
+        None,
+        false,
     ) {
         app.status_message = format!("Save failed: {}", e);
         app.cert_form = Some(form);  // preserve form
@@ -1591,17 +1581,17 @@ fn draw_cert_popup<B: Backend>(f: &mut Frame, form: &CertForm) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(12),   // Form fields area
-            Constraint::Length(4), // Alt names area
-            Constraint::Length(2), // Checkbox
-            Constraint::Length(3), // Controls area
+            Constraint::Percentage(60),
+            Constraint::Percentage(30),
+            Constraint::Percentage(10),
+            Constraint::Percentage(10),
         ])
         .split(inner);
 
         let checkbox_text = if form.generate_new_ca {
-            "[X] Generate new CA"
-        } else {
             "[ ] Generate new CA"
+        } else {
+            "[X] Generate new CA"
         };
 
         let checkbox = Paragraph::new(checkbox_text)

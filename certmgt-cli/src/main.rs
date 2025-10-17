@@ -93,7 +93,7 @@ fn main() -> anyhow::Result<()> {
             force,
             password_file,
         } => {
-            import(&config, inputs, database, compressed, force, password_file)?;
+            import(&config, inputs, database, compressed, force, password_file, true)?;
         }
 
         Commands::Export {
