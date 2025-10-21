@@ -32,6 +32,8 @@ pub enum Commands {
         key_size: u32,
         #[arg(long, help = "Common name", default_value = "example.com")]
         alt_names: Vec<String>,
+        #[arg(long, help = "CA Common name", default_value = "example.com")]
+        ca_common_name: String,
         #[arg(long, help = "CA key size", default_value = "2048")]
         ca_key_size: u32,
         #[arg(long, help = "CA expiration in days", default_value = "365")]

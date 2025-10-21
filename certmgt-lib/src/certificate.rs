@@ -8,7 +8,7 @@ use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
 
 use const_oid::db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION;
-use der::asn1::Null;
+use der::asn1::{Null, Utf8StringRef};
 use der::{Any, Decode, Encode};
 use p12_keystore::{KeyStore, KeyStoreEntry};
 use pem::{Pem, parse, parse_many};
@@ -871,9 +871,12 @@ fn create_distinguished_name(
         rdn_sequence.push(RelativeDistinguishedName::from(org_set));
     }
 
-    // Common Name
-    let cn_value = PrintableString::new(common_name)
-        .map_err(|e| CertMgtError::CaGenerationError(format!("Invalid common name: {}", e)))?;
+    // // Common Name
+    // let cn_value = ::new(common_name)
+    //     .map_err(|e| CertMgtError::CaGenerationError(format!("Invalid common name {}: {}", common_name, e)))?;
+    
+
+    let cn_value = Utf8StringRef::new(common_name)?;
     let cn_bytes = cn_value.to_der().map_err(|e| {
         CertMgtError::CaGenerationError(format!("Common name encoding failed: {}", e))
     })?;
@@ -974,7 +977,7 @@ fn create_server_extensions(
     });
 
     // Extended Key Usage
-    let ext_key_usage = ExtendedKeyUsage::from(vec![const_oid::db::rfc5280::ID_KP_SERVER_AUTH]);
+    let ext_key_usage = ExtendedKeyUsage::from(vec![const_oid::db::rfc5280::ID_KP_SERVER_AUTH, const_oid::db::rfc5280::ID_KP_CLIENT_AUTH]);
     extensions.push(Extension {
         extn_id: const_oid::db::rfc5280::ID_CE_EXT_KEY_USAGE,
         critical: false,

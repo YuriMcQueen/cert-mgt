@@ -419,6 +419,7 @@ fn main() -> anyhow::Result<()> {
             common_name,
             key_size,
             alt_names,
+            ca_common_name,
             ca_validity_days,
             ca_key_size,
             database,
@@ -427,7 +428,7 @@ fn main() -> anyhow::Result<()> {
                 country: country.clone(),
                 state: state.clone(),
                 organization: organization.clone(),
-                common_name: common_name.clone(),
+                common_name: ca_common_name.clone(),
                 key_size: ca_key_size,
                 validity_days: ca_validity_days,
             };

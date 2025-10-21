@@ -1282,7 +1282,8 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
          Valid From: {}\n\
          Valid Until: {}\n\
          Status: {}\n\
-         Cert Data: {}\n",
+         Cert Data: {}\n
+         Key Data: {}\n",
         cert.common_name,
         cert.organization,
         cert.organizational_unit,
@@ -1296,7 +1297,8 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
         not_before,
         not_after,
         status,
-        cert_info.1
+        cert_info.1,
+        cert_info.2.unwrap_or_else(|| "")
     );
 
     let detail_paragraph = Paragraph::new(detail_text)
