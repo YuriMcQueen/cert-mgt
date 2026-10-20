@@ -54,6 +54,9 @@ pub struct App {
     pub ca_list: Vec<CertificateConfig>,
     pub ca_selected: usize,
     pub selected_ca: Option<CertificateConfig>,
+    /// Kept alive for the whole session: on Wayland/X11 the clipboard source
+    /// must stay alive to serve paste requests from other apps.
+    pub clipboard: Option<arboard::Clipboard>,
 }
 
 #[derive(Clone)]
@@ -387,6 +390,7 @@ impl App {
             ca_list: vec![],
             ca_selected: 0,
             selected_ca: None,
+            clipboard: None,
         }
     }
 
@@ -558,28 +562,46 @@ impl App {
         }
     }
 
-    /// Copy the visible certificate data of the detail view to the system clipboard
+    /// Copy the visible certificate data (plus the private key, when present)
+    /// of the detail view to the system clipboard
     pub fn copy_cert_to_clipboard(&mut self, index: usize) {
         let Some(cert) = self.certificates.get(index) else {
             return;
         };
-        let content = match &cert.cert_data {
-            certmgt_lib::CertData::Pem { cert, .. } => cert.clone(),
-            certmgt_lib::CertData::P12 { data, .. } => data.clone(),
+        let (content, has_key) = match &cert.cert_data {
+            certmgt_lib::CertData::Pem { cert, key } => match key {
+                Some(key) => (format!("{cert}\n{key}"), true),
+                None => (cert.clone(), false),
+            },
+            // The P12 blob already contains cert + key
+            certmgt_lib::CertData::P12 { data, .. } => (data.clone(), false),
         };
-        let result: Result<(), arboard::Error> = (|| {
-            let mut clipboard = arboard::Clipboard::new()?;
-            clipboard.set_text(&content)?;
-            Ok(())
-        })();
-        self.status_message = match result {
-            Ok(()) => format!(
-                "{} copied to clipboard ({} bytes)",
-                cert.common_name,
-                content.len()
-            ),
-            Err(e) => format!("Clipboard copy failed: {e}"),
+        // Reuse the session-wide clipboard instance; it must outlive the copy
+        // so other apps can request the contents (and arboard stays quiet).
+        let clipboard = match self.clipboard.as_mut() {
+            Some(cb) => cb,
+            None => match arboard::Clipboard::new() {
+                Ok(cb) => {
+                    self.clipboard = Some(cb);
+                    self.clipboard.as_mut().expect("just inserted")
+                }
+                Err(e) => {
+                    self.status_message = format!("Clipboard unavailable: {e}");
+                    return;
+                }
+            },
         };
+        match clipboard.set_text(&content) {
+            Ok(()) => {
+                let what = if has_key { "cert + key" } else { "cert" };
+                self.status_message = format!(
+                    "{} copied to clipboard ({what}, {} bytes)",
+                    cert.common_name,
+                    content.len()
+                );
+            }
+            Err(e) => self.status_message = format!("Clipboard copy failed: {e}"),
+        }
     }
 }
 
@@ -1361,7 +1383,7 @@ fn draw_certificate_detail(f: &mut Frame, app: &App, index: usize) {
 
     // Navigation help
     let help = Paragraph::new(
-        "Press ESC or Backspace to go back, 'h' for help, 'c' to copy cert, 'q' to quit",
+        "Press ESC or Backspace to go back, 'h' for help, 'c' to copy cert + key, 'q' to quit",
     )
     .style(Style::default().fg(Color::Yellow))
     .block(Block::default().borders(Borders::ALL).title("Navigation"));
