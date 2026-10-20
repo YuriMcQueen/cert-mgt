@@ -19,6 +19,8 @@ build:
   image: rust:latest
   <<: *rust_cache
   script:
+    - rustup component add clippy
+    - cargo clippy --all-targets
     - cargo build --verbose
     - cargo test --verbose
   rules:

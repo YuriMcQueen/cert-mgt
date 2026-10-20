@@ -2,7 +2,8 @@ use crate::CertMgtError;
 use crate::detection::detect_cert_type;
 use crate::types::{CaConfig, CertData, CertDataType, CertificateConfig, ServerCertConfig};
 use crate::utils::{
-    asn1_time_to_timestamp, create_time_from_offset_datetime, generate_secure_serial_number,
+    asn1_time_to_timestamp, canonical_dn, create_time_from_offset_datetime,
+    generate_secure_serial_number, timestamp_to_datetime,
 };
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
@@ -11,7 +12,7 @@ use const_oid::db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION;
 use der::asn1::{Null, Utf8StringRef};
 use der::{Any, Decode, Encode};
 use p12_keystore::{KeyStore, KeyStoreEntry};
-use pem::{Pem, parse, parse_many};
+use pem::{parse, parse_many};
 use rand::thread_rng;
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPublicKey};
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
@@ -23,6 +24,7 @@ use std::error::Error;
 use std::net::IpAddr;
 use std::path::Path;
 use time::{Duration, OffsetDateTime};
+use uuid::Uuid;
 use x509_cert::attr::AttributeTypeAndValue;
 use x509_cert::ext::pkix::KeyUsages;
 use x509_cert::{
@@ -58,12 +60,8 @@ impl CertificateConfig {
                 Self::parse_pem_cert_only(content)
                     .map_err(|e| CertMgtError::InvalidConfiguration(format!("{}: {}", path, e)))
             }
-            CertDataType::PemOnlyKey => Err(CertMgtError::InvalidPrivateKey(format!(
-                "PEM file {} contains only private key, no certificate",
-                path
-            ))),
-            CertDataType::P12 { as_base64 } => Self::parse_p12(&bytes, password, as_base64)
-                .map_err(|e| CertMgtError::InvalidConfiguration(format!("{}: {}", path, e))),
+            CertDataType::PemOnlyKey => Err(CertMgtError::PemKeyOnly),
+            CertDataType::P12 { as_base64 } => Self::parse_p12(&bytes, password, as_base64),
         }
     }
     fn parse_pem_cert_and_key(content: &str) -> Result<Self, Box<dyn Error>> {
@@ -130,7 +128,7 @@ impl CertificateConfig {
         bytes: &[u8],
         password: Option<&str>,
         as_base64: bool,
-    ) -> Result<CertificateConfig, Box<dyn std::error::Error>> {
+    ) -> Result<CertificateConfig, CertMgtError> {
         // Decode base64 if necessary
         let raw = if as_base64 {
             let s = std::str::from_utf8(bytes)?;
@@ -144,12 +142,18 @@ impl CertificateConfig {
         let pwd = if let Some(p) = password {
             p
         } else {
-            return Err("P12 requires a password".into());
+            return Err(CertMgtError::P12PasswordRequired);
         };
 
         // Try to load the PKCS#12 keystore
-        let keystore = KeyStore::from_pkcs12(&raw, pwd)
-            .map_err(|e| format!("Failed to load PKCS#12 with provided password: {}", e))?;
+        let keystore = KeyStore::from_pkcs12(&raw, pwd).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("mac verify failure") {
+                CertMgtError::P12WrongPassword
+            } else {
+                CertMgtError::P12LoadFailed(msg)
+            }
+        })?;
 
         // Build CertData to store the entire original P12 content
         let cert_data = CertData::P12 {
@@ -166,16 +170,17 @@ impl CertificateConfig {
         let mut leaf_cert: Option<X509Certificate> = None;
         let mut all_certs: Vec<X509Certificate> = Vec::new();
 
-        println!("Found {} aliases in keystore", keystore.entries().count());
+        eprintln!("Found {} aliases in keystore", keystore.entries().count());
 
         for alias in keystore.entries() {
-            if let Some(entry) = keystore.entry(&alias.0) {
+            if let Some(entry) = keystore.entry(alias.0) {
                 match entry {
                     KeyStoreEntry::PrivateKeyChain(private_key_chain) => {
                         // First certificate is usually the leaf
                         if let Some(cert) = private_key_chain.chain().first() {
                             let cert_der = cert.as_der();
-                            let (_, parsed_cert) = X509Certificate::from_der(cert_der)?;
+                            let (_, parsed_cert) = X509Certificate::from_der(cert_der)
+                                .map_err(|e| CertMgtError::InvalidConfiguration(e.to_string()))?;
                             if leaf_cert.is_none() {
                                 leaf_cert = Some(parsed_cert.clone());
                             }
@@ -185,13 +190,15 @@ impl CertificateConfig {
                         // Collect remaining chain certificates
                         for cert in private_key_chain.chain().iter().skip(1) {
                             let cert_der = cert.as_der();
-                            let (_, parsed_cert) = X509Certificate::from_der(cert_der)?;
+                            let (_, parsed_cert) = X509Certificate::from_der(cert_der)
+                                .map_err(|e| CertMgtError::InvalidConfiguration(e.to_string()))?;
                             all_certs.push(parsed_cert);
                         }
                     }
                     KeyStoreEntry::Certificate(cert) => {
                         let cert_der = cert.as_der();
-                        let (_, parsed_cert) = X509Certificate::from_der(cert_der)?;
+                        let (_, parsed_cert) = X509Certificate::from_der(cert_der)
+                            .map_err(|e| CertMgtError::InvalidConfiguration(e.to_string()))?;
                         all_certs.push(parsed_cert.clone());
 
                         if leaf_cert.is_none() && parsed_cert.subject() != parsed_cert.issuer() {
@@ -213,9 +220,11 @@ impl CertificateConfig {
                 .or_else(|| all_certs.first().cloned());
         }
 
-        let cert = leaf_cert.ok_or("No leaf certificate found in PKCS#12")?;
-        let cert = get_cert_info(cert, cert_data)?;
-        Ok(cert)
+        let cert = leaf_cert.ok_or(CertMgtError::InvalidConfiguration(
+            "No leaf certificate found in PKCS#12".into(),
+        ))?;
+        get_cert_info(cert, cert_data)
+            .map_err(|e| CertMgtError::InvalidConfiguration(e.to_string()))
     }
 
     pub fn get_cert_pem(&self) -> Option<&str> {
@@ -268,7 +277,7 @@ impl CertificateConfig {
         let subject_public_key_info = public_key.to_public_key_der().map_err(|e| {
             CertMgtError::CaGenerationError(format!("Public key encoding failed: {}", e))
         })?;
-        let spki = SubjectPublicKeyInfo::from_der((&subject_public_key_info).as_ref())
+        let spki = SubjectPublicKeyInfo::from_der(subject_public_key_info.as_ref())
             .map_err(|e| CertMgtError::CaGenerationError(format!("SPKI parsing failed: {}", e)))?;
 
         // Create extensions for CA certificate
@@ -317,7 +326,7 @@ impl CertificateConfig {
         })?;
         let key_pem = pem_encode("PRIVATE KEY", key_der.as_bytes());
 
-        Ok(CertificateConfig {
+        let mut cert = CertificateConfig {
             country: config.country,
             state: config.state,
             locality: "".to_string(),
@@ -325,15 +334,23 @@ impl CertificateConfig {
             organizational_unit: "".to_string(),
             common_name: config.common_name,
             is_ca: true,
-            not_before: now.unix_timestamp(),
-            not_after: (now + Duration::days(config.validity_days as i64)).unix_timestamp(),
+            not_before: timestamp_to_datetime(now.unix_timestamp())?,
+            not_after: timestamp_to_datetime(
+                (now + Duration::days(config.validity_days as i64)).unix_timestamp(),
+            )?,
             key_size: Some(config.key_size as usize),
             cert_data: CertData::Pem {
                 cert: cert_pem,
                 key: Some(key_pem),
             },
             serial_number: "1".to_string(),
-        })
+            id: Uuid::new_v4().to_string(),
+            ca_id: None,
+            issuer_dn: String::new(),
+        };
+        // A CA is self-signed: its issuer is itself
+        cert.issuer_dn = cert.subject_dn();
+        Ok(cert)
     }
 
     /// Sign a server certificate using this CA
@@ -387,7 +404,7 @@ impl CertificateConfig {
 
         // Generate serial number
         let serial_num = generate_secure_serial_number()?;
-        let serial_number = SerialNumber::new(&serial_num.as_bytes()).map_err(|e| {
+        let serial_number = SerialNumber::new(serial_num.as_bytes()).map_err(|e| {
             CertMgtError::CertificateGenerationError(format!(
                 "Serial number creation failed: {}",
                 e
@@ -399,7 +416,7 @@ impl CertificateConfig {
             CertMgtError::CertificateGenerationError(format!("Public key encoding failed: {}", e))
         })?;
         let spki =
-            SubjectPublicKeyInfo::from_der(&subject_public_key_info.as_ref()).map_err(|e| {
+            SubjectPublicKeyInfo::from_der(subject_public_key_info.as_ref()).map_err(|e| {
                 CertMgtError::CertificateGenerationError(format!("SPKI parsing failed: {}", e))
             })?;
 
@@ -458,14 +475,19 @@ impl CertificateConfig {
             organizational_unit: "".to_string(),
             common_name: config.common_name.clone(),
             is_ca: false,
-            not_before: now.unix_timestamp(),
-            not_after: (now + Duration::days(config.validity_days as i64)).unix_timestamp(),
+            not_before: timestamp_to_datetime(now.unix_timestamp())?,
+            not_after: timestamp_to_datetime(
+                (now + Duration::days(config.validity_days as i64)).unix_timestamp(),
+            )?,
             key_size: Some(config.key_size),
             cert_data: CertData::Pem {
                 cert: cert_pem,
                 key: Some(key_pem),
             },
             serial_number: serial_num.to_string(),
+            id: Uuid::new_v4().to_string(),
+            ca_id: Some(self.id.clone()),
+            issuer_dn: self.subject_dn(),
         })
     }
 
@@ -528,7 +550,7 @@ impl CertificateConfig {
             CertMgtError::CertificateGenerationError(format!("Public key encoding failed: {}", e))
         })?;
         let spki =
-            SubjectPublicKeyInfo::from_der(&subject_public_key_info.as_ref()).map_err(|e| {
+            SubjectPublicKeyInfo::from_der(subject_public_key_info.as_ref()).map_err(|e| {
                 CertMgtError::CertificateGenerationError(format!("SPKI parsing failed: {}", e))
             })?;
 
@@ -587,14 +609,19 @@ impl CertificateConfig {
             organizational_unit: self.organizational_unit.clone(),
             common_name: self.common_name.clone(),
             is_ca: false,
-            not_before: now.unix_timestamp(),
-            not_after: (now + Duration::days(new_validity_days as i64)).unix_timestamp(),
+            not_before: timestamp_to_datetime(now.unix_timestamp())?,
+            not_after: timestamp_to_datetime(
+                (now + Duration::days(new_validity_days as i64)).unix_timestamp(),
+            )?,
             key_size: self.key_size,
             cert_data: CertData::Pem {
                 cert: cert_pem,
                 key: Some(key_pem),
             },
             serial_number: next_serial.to_string(),
+            id: Uuid::new_v4().to_string(),
+            ca_id: Some(ca_cert.id.clone()),
+            issuer_dn: ca_cert.subject_dn(),
         })
     }
 
@@ -609,6 +636,29 @@ impl CertificateConfig {
                 })?;
                 RsaPrivateKey::from_pkcs8_der(&key_der).map_err(|e| {
                     CertMgtError::InvalidConfiguration(format!("Private key parsing failed: {}", e))
+                })
+            }
+            CertData::P12 { data, password, .. } => {
+                let filtered: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+                let raw = BASE64_STANDARD.decode(&filtered).map_err(|e| {
+                    CertMgtError::InvalidConfiguration(format!("P12 base64 decode failed: {e}"))
+                })?;
+                let keystore = KeyStore::from_pkcs12(&raw, password).map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("mac verify failure") {
+                        CertMgtError::P12WrongPassword
+                    } else {
+                        CertMgtError::P12LoadFailed(msg)
+                    }
+                })?;
+                let chain = keystore
+                    .private_key_chain()
+                    .map(|(_, chain)| chain)
+                    .ok_or_else(|| {
+                        CertMgtError::InvalidConfiguration("No private key available".to_string())
+                    })?;
+                RsaPrivateKey::from_pkcs8_der(chain.key()).map_err(|e| {
+                    CertMgtError::InvalidConfiguration(format!("Private key parsing failed: {e}"))
                 })
             }
             _ => Err(CertMgtError::InvalidConfiguration(
@@ -657,14 +707,14 @@ impl CertificateConfig {
     pub fn attach_key_from_file(
         &mut self,
         key_path: &Path,
-        password: Option<&str>,
+        _password: Option<&str>,
     ) -> Result<(), CertMgtError> {
         let bytes = std::fs::read(key_path)?;
         let key_str = std::str::from_utf8(&bytes)?;
 
         match &mut self.cert_data {
             CertData::Pem {
-                cert,
+                cert: _,
                 key: existing_key,
             } => {
                 if existing_key.is_some() {
@@ -694,20 +744,20 @@ impl CertificateConfig {
     /// Check if certificate needs renewal
     pub fn needs_renewal(&self, threshold_days: u32) -> bool {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let expiry_threshold = self.not_after - (threshold_days as i64 * 24 * 60 * 60);
+        let expiry_threshold = self.not_after.timestamp() - (threshold_days as i64 * 24 * 60 * 60);
         now >= expiry_threshold
     }
 
     /// Get days until expiration
     pub fn days_until_expiry(&self) -> i64 {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        (self.not_after - now) / (24 * 60 * 60)
+        (self.not_after.timestamp() - now) / (24 * 60 * 60)
     }
 
     /// Check if certificate is expired
     pub fn is_expired(&self) -> bool {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        now > self.not_after
+        now > self.not_after.timestamp()
     }
 
     /// Validate certificate data integrity
@@ -721,7 +771,7 @@ impl CertificateConfig {
 
                 // Then parse the certificate
                 let (_remainder, _cert) =
-                    X509Certificate::from_der(&pem.contents()).map_err(|e| {
+                    X509Certificate::from_der(pem.contents()).map_err(|e| {
                         CertMgtError::InvalidConfiguration(format!("Invalid certificate: {}", e))
                     })?;
 
@@ -736,11 +786,11 @@ impl CertificateConfig {
         match &self.cert_data {
             CertData::Pem { cert, key } => {
                 let mut pem_content = cert.clone();
-                if let Some(key_data) = key {
-                    if !key_data.is_empty() {
-                        pem_content.push('\n');
-                        pem_content.push_str(key_data);
-                    }
+                if let Some(key_data) = key
+                    && !key_data.is_empty()
+                {
+                    pem_content.push('\n');
+                    pem_content.push_str(key_data);
                 }
                 Ok(pem_content)
             }
@@ -762,7 +812,7 @@ impl CertificateConfig {
         }
     }
 
-// Utility functions that work with collections of CertificateConfig
+    // Utility functions that work with collections of CertificateConfig
     /// Find CA certificate from a collection
     pub fn find_ca(certificates: &[CertificateConfig]) -> Option<&CertificateConfig> {
         certificates.iter().find(|cert| cert.is_ca)
@@ -874,7 +924,6 @@ fn create_distinguished_name(
     // // Common Name
     // let cn_value = ::new(common_name)
     //     .map_err(|e| CertMgtError::CaGenerationError(format!("Invalid common name {}: {}", common_name, e)))?;
-    
 
     let cn_value = Utf8StringRef::new(common_name)?;
     let cn_bytes = cn_value.to_der().map_err(|e| {
@@ -977,7 +1026,10 @@ fn create_server_extensions(
     });
 
     // Extended Key Usage
-    let ext_key_usage = ExtendedKeyUsage::from(vec![const_oid::db::rfc5280::ID_KP_SERVER_AUTH, const_oid::db::rfc5280::ID_KP_CLIENT_AUTH]);
+    let ext_key_usage = ExtendedKeyUsage::from(vec![
+        const_oid::db::rfc5280::ID_KP_SERVER_AUTH,
+        const_oid::db::rfc5280::ID_KP_CLIENT_AUTH,
+    ]);
     extensions.push(Extension {
         extn_id: const_oid::db::rfc5280::ID_CE_EXT_KEY_USAGE,
         critical: false,
@@ -1040,10 +1092,10 @@ fn create_server_extensions(
     let ca_public_key_der = ca_public_key.to_public_key_der().map_err(|e| {
         CertMgtError::CertificateGenerationError(format!("CA public key encoding failed: {}", e))
     })?;
-    let key_id = sha1_hash((&ca_public_key_der).as_ref());
+    let key_id = sha1_hash(ca_public_key_der.as_ref());
 
     let authority_key_id = AuthorityKeyIdentifier {
-        key_identifier: Some(der::asn1::OctetString::new(&key_id).map_err(|e| {
+        key_identifier: Some(der::asn1::OctetString::new(key_id).map_err(|e| {
             CertMgtError::CertificateGenerationError(format!(
                 "Key ID OctetString creation failed: {}",
                 e
@@ -1130,6 +1182,16 @@ fn get_subject_attr(parsed: &X509Certificate, oid: Oid) -> String {
         .unwrap_or_default()
 }
 
+fn get_issuer_attr(parsed: &X509Certificate, oid: Oid) -> String {
+    parsed
+        .issuer()
+        .iter_by_oid(&oid)
+        .next()
+        .and_then(|attr| attr.as_str().ok())
+        .map(|s| s.to_owned())
+        .unwrap_or_default()
+}
+
 fn get_key_size(cert: &X509Certificate) -> Option<usize> {
     cert.subject_pki
         .parsed()
@@ -1148,14 +1210,24 @@ fn get_cert_info(
 ) -> Result<CertificateConfig, Box<dyn Error>> {
     let serial_number = cert.serial.to_string();
     let is_ca = cert.is_ca();
-    let not_after = asn1_time_to_timestamp(&cert.validity.not_after);
-    let not_before = asn1_time_to_timestamp(&cert.validity.not_before);
+    let not_after = timestamp_to_datetime(asn1_time_to_timestamp(&cert.validity.not_after))
+        .map_err(|e| e.to_string())?;
+    let not_before = timestamp_to_datetime(asn1_time_to_timestamp(&cert.validity.not_before))
+        .map_err(|e| e.to_string())?;
     let country = get_subject_attr(&cert, oid_registry::OID_X509_COUNTRY_NAME);
     let state = get_subject_attr(&cert, oid_registry::OID_X509_STATE_OR_PROVINCE_NAME);
     let locality = get_subject_attr(&cert, oid_registry::OID_X509_LOCALITY_NAME);
     let organization = get_subject_attr(&cert, oid_registry::OID_X509_ORGANIZATION_NAME);
     let organizational_unit = get_subject_attr(&cert, oid_registry::OID_X509_ORGANIZATIONAL_UNIT);
     let common_name = get_subject_attr(&cert, oid_registry::OID_X509_COMMON_NAME);
+    let issuer_dn = canonical_dn(
+        &get_issuer_attr(&cert, oid_registry::OID_X509_COUNTRY_NAME),
+        &get_issuer_attr(&cert, oid_registry::OID_X509_STATE_OR_PROVINCE_NAME),
+        &get_issuer_attr(&cert, oid_registry::OID_X509_LOCALITY_NAME),
+        &get_issuer_attr(&cert, oid_registry::OID_X509_ORGANIZATION_NAME),
+        &get_issuer_attr(&cert, oid_registry::OID_X509_ORGANIZATIONAL_UNIT),
+        &get_issuer_attr(&cert, oid_registry::OID_X509_COMMON_NAME),
+    );
     let key_size = get_key_size(&cert);
     let cert = CertificateConfig {
         country,
@@ -1170,13 +1242,176 @@ fn get_cert_info(
         key_size,
         cert_data,
         serial_number,
+        id: Uuid::new_v4().to_string(),
+        ca_id: None,
+        issuer_dn,
     };
 
     Ok(cert)
+}
+
+/// Re-link non-CA certificates to their issuing CA by DN.
+/// Runs after import/merge: links freshly imported entries and repairs
+/// links that dangled (e.g. after a CA was force-reimported).
+pub fn relink_ca_references(certificates: &mut [CertificateConfig]) {
+    // Collect CA identity up-front (owned) so we can iterate mutably below
+    let cas: Vec<(String, String)> = certificates
+        .iter()
+        .filter(|c| c.is_ca)
+        .map(|c| (c.id.clone(), c.subject_dn()))
+        .collect();
+    for cert in certificates.iter_mut().filter(|c| !c.is_ca) {
+        if cert
+            .ca_id
+            .as_deref()
+            .is_some_and(|id| cas.iter().any(|(cid, _)| cid == id))
+        {
+            continue;
+        }
+        cert.ca_id = cas
+            .iter()
+            .find(|(_, dn)| *dn == cert.issuer_dn)
+            .map(|(id, _)| id.clone());
+    }
 }
 
 fn sign_with_rsa_sha256(private_key: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>, CertMgtError> {
     let signing_key = SigningKey::<Sha256>::new(private_key.clone());
     let signature = signing_key.sign(data); // Automatically hashes & signs
     Ok(signature.to_bytes().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p12_ca_can_sign_certificates() {
+        let ca = CertificateConfig::new_ca(CaConfig {
+            country: "US".into(),
+            state: "CA".into(),
+            organization: "Test Org".into(),
+            common_name: "Test P12 CA".into(),
+            key_size: 2048,
+            validity_days: 365,
+        })
+        .expect("CA generation failed");
+
+        let (cert_pem, key_pem) = match &ca.cert_data {
+            CertData::Pem {
+                cert,
+                key: Some(key),
+                ..
+            } => (cert.clone(), key.clone()),
+            _ => panic!("expected PEM CA with private key"),
+        };
+
+        let cert_der = pem::parse(&cert_pem).expect("cert PEM").contents().to_vec();
+        let key_der = pem::parse(&key_pem).expect("key PEM").contents().to_vec();
+        let p12_cert = p12_keystore::Certificate::from_der(&cert_der).expect("p12 cert");
+        let chain = p12_keystore::PrivateKeyChain::new(key_der, b"ca", [p12_cert]);
+        let mut keystore = KeyStore::new();
+        keystore.add_entry("ca", KeyStoreEntry::PrivateKeyChain(chain));
+        let p12_bytes = keystore.writer("s3cret").write().expect("p12 write");
+
+        let ca_from_p12 =
+            CertificateConfig::parse_p12(&p12_bytes, Some("s3cret"), false).expect("parse_p12");
+        assert!(ca_from_p12.is_ca);
+        assert!(ca_from_p12.has_private_key());
+
+        let server = CertificateConfig::sign_certificate(
+            &ca_from_p12,
+            &ServerCertConfig {
+                country: "US".into(),
+                state: "CA".into(),
+                organization: "Test Org".into(),
+                common_name: "p12.test.example".into(),
+                alt_names: vec![],
+                key_size: 2048,
+                validity_days: 30,
+            },
+        )
+        .expect("signing with P12 CA must work");
+        assert_eq!(server.common_name, "p12.test.example");
+    }
+
+    #[test]
+    fn generated_cert_links_to_its_ca() {
+        let ca = CertificateConfig::new_ca(CaConfig {
+            country: "US".into(),
+            state: "CA".into(),
+            organization: "Link Org".into(),
+            common_name: "Link CA".into(),
+            key_size: 2048,
+            validity_days: 365,
+        })
+        .expect("CA generation failed");
+
+        // A CA is self-linked: issuer DN is its own subject DN, no ca_id
+        assert_eq!(ca.id.len(), 36, "id must be a UUID v4 string");
+        assert_eq!(ca.ca_id, None);
+        assert_eq!(ca.issuer_dn, ca.subject_dn());
+        assert!(ca.subject_dn().contains("CN=Link CA"));
+
+        let server = CertificateConfig::sign_certificate(
+            &ca,
+            &ServerCertConfig {
+                country: "US".into(),
+                state: "CA".into(),
+                organization: "Link Org".into(),
+                common_name: "linked.test.example".into(),
+                alt_names: vec![],
+                key_size: 2048,
+                validity_days: 30,
+            },
+        )
+        .expect("signing failed");
+
+        // The child cert carries the CA's ID and subject DN as issuer
+        assert_ne!(server.id, ca.id);
+        assert_eq!(server.ca_id, Some(ca.id.clone()));
+        assert_eq!(server.issuer_dn, ca.subject_dn());
+    }
+
+    #[test]
+    fn relink_repairs_dangling_links() {
+        let ca = CertificateConfig::new_ca(CaConfig {
+            country: "US".into(),
+            state: "CA".into(),
+            organization: "Link Org".into(),
+            common_name: "Relink CA".into(),
+            key_size: 2048,
+            validity_days: 365,
+        })
+        .expect("CA generation failed");
+
+        let server = CertificateConfig::sign_certificate(
+            &ca,
+            &ServerCertConfig {
+                country: "US".into(),
+                state: "CA".into(),
+                organization: "Link Org".into(),
+                common_name: "relinked.test.example".into(),
+                alt_names: vec![],
+                key_size: 2048,
+                validity_days: 30,
+            },
+        )
+        .expect("signing failed");
+
+        let mut certs = vec![ca, server];
+        // Simulate a CA force-reimport: the child still points at the dead ID
+        certs[1].ca_id = Some("dead-id".into());
+        relink_ca_references(&mut certs);
+        // The DN still matches the live CA → link is repaired
+        assert_eq!(certs[1].ca_id, Some(certs[0].id.clone()));
+
+        // An external issuer (DN matches no CA) must remain unlinked
+        let mut orphan = certs[1].clone();
+        orphan.issuer_dn = "CN=Unknown External CA".to_string();
+        orphan.ca_id = None;
+        let mut all = vec![certs[0].clone(), orphan];
+        relink_ca_references(&mut all);
+        assert_eq!(all[1].ca_id, None);
+    }
 }

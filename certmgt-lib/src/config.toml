@@ -1,7 +1,0 @@
-compression = "Snappy"
-statistics = true
-row_group_size = 20
-[p12_passwords]
-"cert_bundle.p12" = "password"
-
-p12_passwords = ["password"]

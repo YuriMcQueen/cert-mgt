@@ -1,5 +1,23 @@
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, TimeZone, Utc};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+
+/// Keeps the on-disk JSON format as unix-seconds i64 (backward compatible)
+/// while the in-memory representation is a typed `DateTime<Utc>`.
+mod unix_ts {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(dt: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_i64(dt.timestamp())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        let ts = i64::deserialize(d)?;
+        Utc.timestamp_opt(ts, 0)
+            .single()
+            .ok_or_else(|| serde::de::Error::custom("invalid unix timestamp"))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificateConfig {
@@ -10,11 +28,33 @@ pub struct CertificateConfig {
     pub organizational_unit: String,
     pub common_name: String,
     pub is_ca: bool,
-    pub not_after: i64,
-    pub not_before: i64,
+    #[serde(with = "unix_ts")]
+    pub not_after: DateTime<Utc>,
+    #[serde(with = "unix_ts")]
+    pub not_before: DateTime<Utc>,
     pub key_size: Option<usize>,
     pub cert_data: CertData,
     pub serial_number: String,
+    /// Stable unique ID for this entry (UUID v4); preserved across re-imports
+    pub id: String,
+    /// ID of the CA that issued this certificate (`None` for CAs and unknown issuers)
+    pub ca_id: Option<String>,
+    /// Canonical issuer DN string (display fallback + re-linking)
+    pub issuer_dn: String,
+}
+
+impl CertificateConfig {
+    /// Canonical DN string for this certificate's subject
+    pub fn subject_dn(&self) -> String {
+        crate::utils::canonical_dn(
+            &self.country,
+            &self.state,
+            &self.locality,
+            &self.organization,
+            &self.organizational_unit,
+            &self.common_name,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,7 +89,7 @@ impl fmt::Display for CertData {
             } => {
                 writeln!(f, "PKCS#12 certificate (as_base64={}):", as_base64)?;
                 writeln!(f, "{}", data.replace("\\n", "\n"))?;
-                writeln!(f, "Password: {}", password)?;
+                writeln!(f, "Password: {}", "*".repeat(password.len()))?;
                 Ok(())
             }
         }
@@ -110,5 +150,72 @@ impl Default for ServerCertConfig {
             key_size: 2048,
             validity_days: 365,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_config() -> CertificateConfig {
+        CertificateConfig {
+            country: "US".to_string(),
+            state: "IL".to_string(),
+            locality: "Chicago".to_string(),
+            organization: "Test".to_string(),
+            organizational_unit: "Unit".to_string(),
+            common_name: "example.test".to_string(),
+            is_ca: false,
+            not_before: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            not_after: Utc.timestamp_opt(1_800_000_000, 0).unwrap(),
+            key_size: None,
+            cert_data: CertData::Pem {
+                cert: "MIIB".to_string(),
+                key: None,
+            },
+            serial_number: "1".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            ca_id: None,
+            issuer_dn: "CN=Test CA".to_string(),
+        }
+    }
+
+    #[test]
+    fn timestamps_roundtrip_as_unix_seconds() {
+        let config = sample_config();
+        // On-disk format must stay integer unix seconds (backward compatible)
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["not_before"], 1_700_000_000i64);
+        assert_eq!(value["not_after"], 1_800_000_000i64);
+
+        let restored: CertificateConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.not_before, config.not_before);
+        assert_eq!(restored.not_after, config.not_after);
+    }
+
+    #[test]
+    fn legacy_integer_timestamps_deserialize() {
+        // Existing databases store bare integers; they must still load.
+        let json = r#"{
+            "country": "US", "state": "IL", "locality": "",
+            "organization": "Test", "organizational_unit": "",
+            "common_name": "legacy.test", "is_ca": true,
+            "not_before": 1672531200, "not_after": 1988083200,
+            "key_size": 2048,
+            "cert_data": { "Pem": { "cert": "MIIB", "key": "LS0t" } },
+            "serial_number": "1",
+            "id": "00000000-0000-4000-8000-000000000000",
+            "ca_id": null,
+            "issuer_dn": "CN=legacy.test"
+        }"#;
+        let config: CertificateConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.not_before,
+            Utc.timestamp_opt(1_672_531_200, 0).unwrap()
+        );
+        assert_eq!(
+            config.not_after,
+            Utc.timestamp_opt(1_988_083_200, 0).unwrap()
+        );
     }
 }

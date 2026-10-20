@@ -1,4 +1,5 @@
 use crate::CertMgtError;
+use chrono::{DateTime, Utc};
 use rand::{RngCore, thread_rng};
 use time::OffsetDateTime;
 use x509_cert::serial_number::SerialNumber;
@@ -7,6 +8,42 @@ use x509_parser::prelude::ASN1Time;
 
 pub fn asn1_time_to_timestamp(asn1_time: &ASN1Time) -> i64 {
     asn1_time.timestamp()
+}
+
+/// Convert a unix-seconds timestamp to a typed `DateTime<Utc>`.
+pub fn timestamp_to_datetime(ts: i64) -> Result<DateTime<Utc>, CertMgtError> {
+    DateTime::from_timestamp(ts, 0)
+        .ok_or_else(|| CertMgtError::InvalidConfiguration(format!("invalid unix timestamp: {ts}")))
+}
+
+/// Canonical DN string from subject components, in a fixed order so that
+/// equal DNs always produce equal strings (used for CA matching on import)
+pub fn canonical_dn(
+    country: &str,
+    state: &str,
+    locality: &str,
+    organization: &str,
+    organizational_unit: &str,
+    common_name: &str,
+) -> String {
+    let mut parts = Vec::new();
+    if !country.is_empty() {
+        parts.push(format!("C={country}"));
+    }
+    if !state.is_empty() {
+        parts.push(format!("ST={state}"));
+    }
+    if !locality.is_empty() {
+        parts.push(format!("L={locality}"));
+    }
+    if !organization.is_empty() {
+        parts.push(format!("O={organization}"));
+    }
+    if !organizational_unit.is_empty() {
+        parts.push(format!("OU={organizational_unit}"));
+    }
+    parts.push(format!("CN={common_name}"));
+    parts.join(", ")
 }
 pub fn create_time_from_offset_datetime(dt: OffsetDateTime) -> Result<Time, CertMgtError> {
     use der::asn1::{GeneralizedTime, UtcTime};

@@ -32,7 +32,9 @@ pem = "3.0.5"
 walkdir = "2.5.0"
 sha2 = "0.10.9"
 hex = "0.4.3"
+arboard = "3"
 
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "2.1"
+tempfile = "3"

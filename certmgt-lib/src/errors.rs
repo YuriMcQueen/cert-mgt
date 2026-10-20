@@ -71,4 +71,16 @@ pub enum CertMgtError {
 
     #[error("Error: {0}")]
     SerialNumberError(#[from] der::Error),
+
+    #[error("P12 certificate requires a password")]
+    P12PasswordRequired,
+
+    #[error("P12 password is incorrect")]
+    P12WrongPassword,
+
+    #[error("Failed to load PKCS#12: {0}")]
+    P12LoadFailed(String),
+
+    #[error("PEM file contains only a private key, no certificate")]
+    PemKeyOnly,
 }

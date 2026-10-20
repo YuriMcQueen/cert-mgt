@@ -183,16 +183,13 @@ impl FilterExpression {
         match self.field {
             FilterField::CommonName => FilterValue::String(config.common_name.clone()),
             FilterField::Organization => FilterValue::String(config.organization.clone()),
-            FilterField::NotAfter => FilterValue::Number(config.not_after),
-            FilterField::NotBefore => FilterValue::Number(config.not_before),
+            FilterField::NotAfter => FilterValue::Number(config.not_after.timestamp()),
+            FilterField::NotBefore => FilterValue::Number(config.not_before.timestamp()),
             FilterField::IsCA => FilterValue::Boolean(config.is_ca),
-            FilterField::HasPrivateKey => {
-                let has_key = match &config.cert_data {
-                    CertData::Pem { key: Some(_), .. } => true,
-                    _ => false,
-                };
-                FilterValue::Boolean(has_key)
-            }
+            FilterField::HasPrivateKey => FilterValue::Boolean(matches!(
+                &config.cert_data,
+                CertData::Pem { key: Some(_), .. }
+            )),
         }
     }
 
@@ -292,7 +289,10 @@ pub fn find_expiring_certificates(
 
     Ok(certificates
         .into_iter()
-        .filter(|config| config.not_after <= threshold && config.not_after > 0)
+        .filter(|config| {
+            let ts = config.not_after.timestamp();
+            ts <= threshold && ts > 0
+        })
         .collect())
 }
 
@@ -320,7 +320,7 @@ mod tests {
             "organization~example".to_string(),
             "is_ca==true".to_string(),
         ];
-        let logic = FilterLogic::from_strings(filters, false).unwrap();
+        let _logic = FilterLogic::from_strings(filters, false).unwrap();
         // This would match certificates where organization contains "example" AND is_ca is true
     }
 

@@ -4,7 +4,6 @@ use rpassword::read_password;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::{collections::HashMap, fs, io, path::PathBuf};
-use toml::value::Time;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -35,10 +34,14 @@ impl TuiConfig {
         match self.p12_passwords {
             Some(PasswordSourceConfig::Map(ref map)) => map
                 .iter()
-                .map(|(x, y)| format!("{}:{}", x, y))
+                .map(|(x, y)| format!("{}:{}", x, "*".repeat(y.len())))
                 .collect::<Vec<_>>()
                 .join(","),
-            Some(PasswordSourceConfig::List(ref list)) => list.join(","),
+            Some(PasswordSourceConfig::List(ref list)) => list
+                .iter()
+                .map(|p| "*".repeat(p.len()).to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             None => String::from(""),
         }
     }
@@ -60,15 +63,15 @@ impl Default for TuiConfig {
 
 impl TuiConfig {
     pub fn load() -> Self {
-        if let Some(config_path) = Self::config_file_path() {
-            if config_path.exists() {
-                match fs::read_to_string(&config_path) {
-                    Ok(content) => match toml::from_str(&content) {
-                        Ok(config) => return config,
-                        Err(e) => eprintln!("Warning: Failed to parse config file: {}", e),
-                    },
-                    Err(e) => eprintln!("Warning: Failed to read config file: {}", e),
-                }
+        if let Some(config_path) = Self::config_file_path()
+            && config_path.exists()
+        {
+            match fs::read_to_string(&config_path) {
+                Ok(content) => match toml::from_str(&content) {
+                    Ok(config) => return config,
+                    Err(e) => eprintln!("Warning: Failed to parse config file: {}", e),
+                },
+                Err(e) => eprintln!("Warning: Failed to read config file: {}", e),
             }
         }
         Self::default()
@@ -103,17 +106,16 @@ impl TuiConfig {
     /// Try to unlock a p12 using map first, then list, then prompt.
     pub fn try_passwords_for_file(&self, file_path: &std::path::Path) -> Option<CertificateConfig> {
         let file_name = file_path.file_name()?.to_string_lossy().to_string();
-        eprintln!("DEBUG: Loaded p12_passwords = {:?}", self.p12_passwords);
         // 1. Try explicit map
-        if let Some(PasswordSourceConfig::Map(map)) = &self.p12_passwords {
-            if let Some(pw) = map.get(&file_name) {
-                if let Ok(config) =
-                    CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(pw))
-                {
-                    return Some(config);
-                } else {
-                    eprintln!("Warning: Failed to read config file: {}", file_name);
-                }
+        if let Some(PasswordSourceConfig::Map(map)) = &self.p12_passwords
+            && let Some(pw) = map.get(&file_name)
+        {
+            if let Ok(config) =
+                CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(pw))
+            {
+                return Some(config);
+            } else {
+                eprintln!("Warning: Failed to read config file: {}", file_name);
             }
         }
 
@@ -133,14 +135,12 @@ impl TuiConfig {
         // 3. Fallback to interactive input
         // (optional: only if in TUI/CLI context)
         println!("Enter password for {}: ", file_name);
-        if let Ok(password) = read_password() {
-            if !password.is_empty() {
-                if let Ok(config) =
-                    CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password))
-                {
-                    return Some(config);
-                }
-            }
+        if let Ok(password) = read_password()
+            && !password.is_empty()
+            && let Ok(config) =
+                CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password))
+        {
+            return Some(config);
         }
 
         None
@@ -155,17 +155,15 @@ pub fn load_passwords(path: &Path) -> io::Result<PasswordSourceConfig> {
     let mut map = HashMap::new();
     let mut list = Vec::new();
 
-    for line in reader.lines() {
-        if let Ok(l) = line {
-            let line = l.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((fname, pw)) = line.split_once('=') {
-                map.insert(fname.trim().to_string(), pw.trim().to_string());
-            } else {
-                list.push(line.to_string());
-            }
+    for l in reader.lines().map_while(Result::ok) {
+        let line = l.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((fname, pw)) = line.split_once('=') {
+            map.insert(fname.trim().to_string(), pw.trim().to_string());
+        } else {
+            list.push(line.to_string());
         }
     }
 

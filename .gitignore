@@ -15,3 +15,14 @@ Thumbs.db
 *.log
 *.bak
 *.swp
+
+# Certificate artifacts — never commit keys or generated certs
+*.pem
+*.p12
+*.b64
+*.parquet
+/p12
+*.json
+
+# Stale build leftovers
+*.old

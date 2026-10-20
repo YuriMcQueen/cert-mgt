@@ -1,24 +1,24 @@
-use crate::{
+use crate::config::{PasswordSourceConfig, TuiConfig, load_passwords};
+use crate::db::{
     cert_fingerprint, discover_cert_files, is_compressed_file, load_certificates_from_database,
 };
+use anyhow::Result;
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
-use certmgt_lib::{CertData, CertMgtError, CertificateConfig};
+use certmgt_lib::{CertData, CertMgtError, CertificateConfig, relink_ca_references};
 use flate2::{Compression, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use crate::config::TuiConfig;
-use anyhow::Result;
 
-trait IntoCertConfigs {
+pub trait IntoCertConfigs {
     fn into_configs(self, tui_config: TuiConfig, prints: bool) -> Result<Vec<CertificateConfig>>;
 }
 
 impl IntoCertConfigs for Vec<PathBuf> {
-    fn into_configs(self, tui_config: TuiConfig, prints: bool)-> Result<Vec<CertificateConfig>> {
+    fn into_configs(self, tui_config: TuiConfig, prints: bool) -> Result<Vec<CertificateConfig>> {
         discover_and_parse(self, &tui_config, None, prints) // or pass password_file externally
     }
 }
@@ -37,14 +37,6 @@ pub struct CertificateDatabase {
 }
 
 impl CertificateDatabase {
-    pub fn new() -> Self {
-        Self {
-            version: "1.0".to_string(),
-            created_at: chrono::Utc::now().timestamp(),
-            certificates: Vec::new(),
-        }
-    }
-
     pub fn with_certificates(certificates: Vec<CertificateConfig>) -> Self {
         Self {
             version: "1.0".to_string(),
@@ -76,21 +68,25 @@ pub fn import<T: IntoCertConfigs>(
     database: PathBuf,
     compressed: bool,
     force: bool,
-    password_file: Option<PathBuf>,
+    _password_file: Option<PathBuf>,
     prints: bool,
 ) -> Result<()> {
     let mut final_configs = load_existing_database(&database, prints)?;
-    let mut seen: HashSet<String> =
-        final_configs.iter().map(|c| cert_fingerprint(&c.cert_data)).collect();
+    let mut seen: HashSet<String> = final_configs
+        .iter()
+        .map(|c| cert_fingerprint(&c.cert_data))
+        .collect();
 
-    let new_configs = inputs.into_configs(tui_config.clone(), prints)
-        .map_err(anyhow::Error::from)?;
+    let new_configs = inputs.into_configs(tui_config.clone(), prints)?;
 
     let (imported, skipped, overridden) =
         merge_configs(new_configs, &mut final_configs, &mut seen, force, prints);
 
+    // Link certs to their issuing CAs (batch + existing DB)
+    relink_ca_references(&mut final_configs);
+
     save_database(&database, compressed, final_configs)?;
-    if prints{
+    if prints {
         println!(
             "✅ Import complete: {} new, {} skipped, {} overridden",
             imported, skipped, overridden
@@ -100,8 +96,7 @@ pub fn import<T: IntoCertConfigs>(
     Ok(())
 }
 
-
-fn load_existing_database(database: &PathBuf, prints: bool) -> Result<Vec<CertificateConfig>> {
+fn load_existing_database(database: &Path, prints: bool) -> Result<Vec<CertificateConfig>> {
     if database.exists() {
         match load_certificates_from_database(database) {
             Ok(existing) => {
@@ -138,11 +133,17 @@ fn discover_and_parse(
             continue;
         }
         if prints {
-            println!("Found {} certificates in {}", discovered_files.len(), p.display());
+            println!(
+                "Found {} certificates in {}",
+                discovered_files.len(),
+                p.display()
+            );
         }
 
         for file_path in discovered_files {
-            if let Some(config) = parse_certificate_file(&file_path, tui_config, password_file.as_ref().map(|p| p.as_path()), prints) {
+            if let Some(config) =
+                parse_certificate_file(&file_path, tui_config, password_file.as_deref(), prints)
+            {
                 configs.push(config);
             }
         }
@@ -156,58 +157,53 @@ fn parse_certificate_file(
     password_file: Option<&Path>,
     prints: bool,
 ) -> Option<CertificateConfig> {
-    loop {
-        match CertificateConfig::read_from_path(file_path.to_str().unwrap_or_default(), None) {
-            Ok(config) => return Some(config),
+    match CertificateConfig::read_from_path(file_path.to_str().unwrap_or_default(), None) {
+        Ok(config) => Some(config),
 
-            // Handle password-protected P12
-            Err(e) if e.to_string().contains("requires a password") => {
-                if let Some(config) = try_with_passwords(tui_config, file_path, password_file) {
-                    return Some(config);
-                }
+        // Handle password-protected P12
+        Err(CertMgtError::P12PasswordRequired) => {
+            if let Some(config) = try_with_passwords(tui_config, file_path, password_file) {
+                return Some(config);
+            }
 
-                // Interactive fallback
+            // Interactive fallback
+            if prints {
+                eprintln!("P12 file {} requires a password.", file_path.display());
+                eprint!("Enter password: ");
+            }
+            io::stdout().flush().ok()?;
+            let password = rpassword::read_password().ok()?;
+            if let Ok(config) =
+                CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password))
+            {
+                Some(config)
+            } else {
                 if prints {
-                    eprintln!("P12 file {} requires a password.", file_path.display());
-                    eprint!("Enter password: ");
+                    eprintln!("Password did not work for {}", file_path.display());
                 }
-                io::stdout().flush().ok()?;
-                let password = rpassword::read_password().ok()?;
-                if let Ok(config) =
-                    CertificateConfig::read_from_path(file_path.to_str().unwrap(), Some(&password))
-                {
-                    return Some(config);
-                } else {
-                    if prints {
-                        eprintln!("Password did not work for {}", file_path.display());
-                    }
-                    return None;
-                }
+                None
             }
+        }
 
-            // Handle PEM key-only file
-            Err(e) if e.to_string().contains("PEM file contains only private key") => {
-                return match find_and_attach_matching_cert(file_path) {
-                    Ok(config) => Some(config),
-                    Err(e) => {
-                        if prints {
-                            eprintln!("Error resolving PEM key {}: {}", file_path.display(), e);
-                        }
-                        None
-                    }
-                };
-            }
-
+        // Handle PEM key-only file
+        Err(CertMgtError::PemKeyOnly) => match find_and_attach_matching_cert(file_path) {
+            Ok(config) => Some(config),
             Err(e) => {
                 if prints {
-                    eprintln!("Error reading {}: {}", file_path.display(), e);
+                    eprintln!("Error resolving PEM key {}: {}", file_path.display(), e);
                 }
-                return None;
+                None
             }
+        },
+
+        Err(e) => {
+            if prints {
+                eprintln!("Error reading {}: {}", file_path.display(), e);
+            }
+            None
         }
     }
 }
-
 
 fn try_with_passwords(
     tui_config: &TuiConfig,
@@ -219,21 +215,35 @@ fn try_with_passwords(
         return Some(configured);
     }
 
-    // 2. Password file fallback
-    if let Some(pf) = password_file {
-        if let Ok(password) = std::fs::read_to_string(pf) {
-            if let Ok(config) = CertificateConfig::read_from_path(
-                file_path.to_str().unwrap(),
-                Some(password.trim()),
-            ) {
-                return Some(config);
+    // 2. Password file fallback (lines of `file=pw`, or one password per line)
+    if let Some(pf) = password_file
+        && let Ok(sources) = load_passwords(pf)
+    {
+        let file_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let mut candidates: Vec<String> = Vec::new();
+        match sources {
+            PasswordSourceConfig::Map(map) => {
+                if let Some(pw) = map.get(file_name) {
+                    candidates.push(pw.clone());
+                }
+                candidates.extend(map.values().cloned());
+            }
+            PasswordSourceConfig::List(list) => candidates.extend(list),
+        }
+        if let Some(path_str) = file_path.to_str() {
+            for pw in &candidates {
+                if let Ok(config) = CertificateConfig::read_from_path(path_str, Some(pw)) {
+                    return Some(config);
+                }
             }
         }
     }
 
     None
 }
-
 
 fn find_and_attach_matching_cert(
     file_path: &Path,
@@ -255,7 +265,11 @@ fn find_and_attach_matching_cert(
         cert_config.attach_key_from_file(file_path, None)?;
         Ok(cert_config)
     } else {
-        Err(format!("No matching certificate found for key {}", file_path.display()).into())
+        Err(format!(
+            "No matching certificate found for key {}",
+            file_path.display()
+        )
+        .into())
     }
 }
 
@@ -270,7 +284,7 @@ fn merge_configs(
     let mut skipped = 0;
     let mut overridden = 0;
 
-    for config in new_configs {
+    for mut config in new_configs {
         let fp = cert_fingerprint(&config.cert_data);
         if seen.contains(&fp) {
             if force {
@@ -278,7 +292,15 @@ fn merge_configs(
                     println!("Overriding duplicate: {}", config.common_name);
                 }
                 overridden += 1;
+                // Preserve the stable ID so CA links from other certs survive
+                let old_id = final_configs
+                    .iter()
+                    .find(|c| cert_fingerprint(&c.cert_data) == fp)
+                    .map(|c| c.id.clone());
                 final_configs.retain(|c| cert_fingerprint(&c.cert_data) != fp);
+                if let Some(id) = old_id {
+                    config.id = id;
+                }
             } else {
                 if prints {
                     println!("Skipping duplicate: {}", config.common_name);
@@ -296,16 +318,25 @@ fn merge_configs(
     (imported, skipped, overridden)
 }
 
-fn save_database(
-    database: &PathBuf,
+pub fn save_database(
+    database: &Path,
     compressed: bool,
     configs: Vec<CertificateConfig>,
 ) -> Result<()> {
-    let use_compression = compressed || is_compressed_file(database);
-    if use_compression {
-        save_certificates_to_json_compressed(configs, database)?;
+    // The loader picks its codec by extension, so the extension is the
+    // single source of truth. Honor an explicit --compressed request by
+    // switching to a .json.gz path instead of writing gz bytes into a
+    // .json file.
+    let gz_path = database.with_extension("json.gz");
+    let path: &Path = if compressed && !is_compressed_file(database) {
+        &gz_path
     } else {
-        save_certificates_to_json(configs, database)?;
+        database
+    };
+    if is_compressed_file(path) {
+        save_certificates_to_json_compressed(configs, path)?;
+    } else {
+        save_certificates_to_json(configs, path)?;
     }
     Ok(())
 }
@@ -349,11 +380,11 @@ pub fn export_certificate(
         CertData::Pem { cert, key } => {
             // Export as PEM file - combine cert and key if both exist
             let mut pem_content = cert.clone();
-            if let Some(key_data) = key {
-                if !key_data.is_empty() {
-                    pem_content.push('\n');
-                    pem_content.push_str(key_data);
-                }
+            if let Some(key_data) = key
+                && !key_data.is_empty()
+            {
+                pem_content.push('\n');
+                pem_content.push_str(key_data);
             }
             std::fs::write(output_path, pem_content)?;
         }
@@ -398,10 +429,10 @@ where
 
     for (index, config) in configs.iter().enumerate() {
         // Apply filter if provided
-        if let Some(ref filter_fn) = filter {
-            if !filter_fn(config) {
-                continue;
-            }
+        if let Some(ref filter_fn) = filter
+            && !filter_fn(config)
+        {
+            continue;
         }
 
         // Generate filename based on common name and certificate type
@@ -549,23 +580,7 @@ fn validate_private_key(key_content: &str, password: Option<&str>) -> Result<(),
     Ok(())
 }
 
-/// List all certificates in a JSON database that don't have private keys
-pub fn list_certificates_without_keys(json_path: &Path) -> Result<Vec<String>, CertMgtError> {
-    let configs = load_certificates_from_json(json_path)?;
-
-    let certs_without_keys: Vec<String> = configs
-        .iter()
-        .filter_map(|config| match &config.cert_data {
-            CertData::Pem { key: None, .. } => Some(config.common_name.clone()),
-            _ => None,
-        })
-        .collect();
-
-    Ok(certs_without_keys)
-}
-
 /// Get all certificate common names from a JSON database
-
 pub fn list_all_certificate_names(json_path: &Path) -> Result<Vec<String>, CertMgtError> {
     // Match on the Option<Option<&str>> returned by extension()
     let configs = match json_path.extension().and_then(|ext| ext.to_str()) {
@@ -578,45 +593,4 @@ pub fn list_all_certificate_names(json_path: &Path) -> Result<Vec<String>, CertM
         .into_iter()
         .map(|config| config.common_name)
         .collect())
-}
-
-// Helper functions for querying certificates (basic filtering without SQL-like operations)
-pub fn find_certificates_by_common_name(
-    json_path: &Path,
-    common_name: &str,
-) -> Result<Vec<CertificateConfig>, CertMgtError> {
-    let configs = load_certificates_from_json(json_path)?;
-    Ok(configs
-        .into_iter()
-        .filter(|config| config.common_name.contains(common_name))
-        .collect())
-}
-
-pub fn find_certificates_by_organization(
-    json_path: &Path,
-    organization: &str,
-) -> Result<Vec<CertificateConfig>, CertMgtError> {
-    let configs = load_certificates_from_json(json_path)?;
-    Ok(configs
-        .into_iter()
-        .filter(|config| config.organization.contains(organization))
-        .collect())
-}
-
-pub fn find_expiring_certificates(
-    json_path: &Path,
-    days_ahead: i64,
-) -> Result<Vec<CertificateConfig>, CertMgtError> {
-    let configs = load_certificates_from_json(json_path)?;
-    let threshold = chrono::Utc::now().timestamp() + (days_ahead * 24 * 60 * 60);
-
-    Ok(configs
-        .into_iter()
-        .filter(|config| config.not_after <= threshold && config.not_after > 0)
-        .collect())
-}
-
-pub fn find_ca_certificates(json_path: &Path) -> Result<Vec<CertificateConfig>, CertMgtError> {
-    let configs = load_certificates_from_json(json_path)?;
-    Ok(configs.into_iter().filter(|config| config.is_ca).collect())
 }

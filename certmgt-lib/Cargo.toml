@@ -23,6 +23,7 @@ spki = "0.7"
 pkcs8 = { version = "0.10", features = ["alloc"] }
 rsa = { version = "0.9.8", features = ["sha2"] }
 rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 
 sha1 = "0.10"

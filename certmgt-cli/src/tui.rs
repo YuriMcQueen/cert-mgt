@@ -1,7 +1,7 @@
 // Add this to your main.rs file
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -14,23 +14,26 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::path::PathBuf;
-use std::{fs, io, path::Path};
+use std::{io, path::Path};
 
 use crate::config::TuiConfig;
-use crate::json::{import, save_certificates_to_json};
-use crate::load_certificates_from_database;
+use crate::db::load_certificates_from_database;
+use crate::json::import;
 use certmgt_lib::types::{CaConfig, ServerCertConfig};
 use certmgt_lib::{CertMgtError, CertificateConfig};
 use ratatui::layout::Margin;
 use ratatui::style::palette::material::GREEN;
 use ratatui::style::palette::tailwind::SLATE;
-use ratatui::widgets::ScrollbarState;
-use certmgt_lib::filters::FilterOp::Contains;
 
+#[allow(dead_code)]
 const NORMAL_ROW_BG: Color = SLATE.c950;
+#[allow(dead_code)]
 const ALT_ROW_BG_COLOR: Color = SLATE.c900;
+#[allow(dead_code)]
 const SELECTED_STYLE: Style = Style::new().bg(SLATE.c800).add_modifier(Modifier::BOLD);
+#[allow(dead_code)]
 const TEXT_FG_COLOR: Color = SLATE.c200;
+#[allow(dead_code)]
 const COMPLETED_TEXT_FG_COLOR: Color = GREEN.c500;
 
 // Enhanced App struct with configuration and setup screen
@@ -44,13 +47,12 @@ pub struct App {
     pub config: TuiConfig,
     pub input_buffer: String,
     pub input_mode: bool,
-    pub setup_state: SetupState,
     pub vertical_scroll: u16,
     pub show_generate_popup: bool,
     pub cert_form: Option<CertForm>,
     pub show_ca_selector: bool,
     pub ca_list: Vec<CertificateConfig>,
-    pub ca_selected: usize, 
+    pub ca_selected: usize,
     pub selected_ca: Option<CertificateConfig>,
 }
 
@@ -188,6 +190,7 @@ impl CertForm {
         ];
     }
 
+    #[allow(dead_code)]
     pub fn add_char(&mut self, c: char) -> String {
         if self.field_index < self.fields.len() {
             let field = &mut self.fields[self.field_index];
@@ -226,6 +229,7 @@ impl CertForm {
         "add_char: invalid field_index".to_string()
     }
 
+    #[allow(dead_code)]
     pub fn delete_char(&mut self) -> String {
         if self.field_index < self.fields.len() {
             let field = &mut self.fields[self.field_index];
@@ -261,31 +265,31 @@ impl CertForm {
             2 => self.organization = field_value.clone(),
             3 => self.common_name = field_value.clone(),
             4 => {
-                if let Ok(size) = field_value.parse::<u32>() {
-                    if size >= 1024 && size <= 8192 {
-                        self.key_size = size;
-                    }
+                if let Ok(size) = field_value.parse::<u32>()
+                    && (1024..=8192).contains(&size)
+                {
+                    self.key_size = size;
                 }
             }
             5 => {
-                if let Ok(days) = field_value.parse::<u32>() {
-                    if days >= 1 && days <= 36500 {
-                        self.validity_days = days;
-                    }
+                if let Ok(days) = field_value.parse::<u32>()
+                    && (1..=36500).contains(&days)
+                {
+                    self.validity_days = days;
                 }
             }
             6 => {
-                if let Ok(size) = field_value.parse::<u32>() {
-                    if size >= 2048 && size <= 8192 {
-                        self.ca_key_size = size;
-                    }
+                if let Ok(size) = field_value.parse::<u32>()
+                    && (2048..=8192).contains(&size)
+                {
+                    self.ca_key_size = size;
                 }
             }
             7 => {
-                if let Ok(days) = field_value.parse::<u32>() {
-                    if days >= 1 && days <= 36500 {
-                        self.ca_validity_days = days;
-                    }
+                if let Ok(days) = field_value.parse::<u32>()
+                    && (1..=36500).contains(&days)
+                {
+                    self.ca_validity_days = days;
                 }
             }
             8 => self.temp_alt_name = field_value.clone(),
@@ -298,7 +302,7 @@ impl CertForm {
         let mut is_valid = true;
 
         // Check required fields
-        for (index, field) in self.fields.iter_mut().enumerate() {
+        for field in self.fields.iter_mut() {
             field.validation_error = None;
 
             if field.required && field.value.trim().is_empty() {
@@ -310,11 +314,11 @@ impl CertForm {
             if field.field_type == FieldType::Number && !field.value.trim().is_empty() {
                 match field.value.parse::<u32>() {
                     Ok(value) => {
-                        let (min_val, max_val) = match index {
-                            4 => (1024, 8192), // Key size
-                            5 => (1, 36500),   // Validity days
-                            6 => (2048, 8192), // CA key size
-                            7 => (1, 36500),   // CA validity days
+                        let (min_val, max_val) = match field.name.as_str() {
+                            "Key Size" => (1024, 8192),
+                            "Validity Days" => (1, 36500),
+                            "CA Key Size" => (2048, 8192),
+                            "CA Validity Days" => (1, 36500),
                             _ => continue,
                         };
 
@@ -336,12 +340,13 @@ impl CertForm {
     }
 
     pub fn next_field(&mut self) {
-        self.field_index = (self.field_index + 1) % self.fields.len();
+        // Index `fields.len()` is the "Generate new CA" checkbox
+        self.field_index = (self.field_index + 1) % (self.fields.len() + 1);
     }
 
     pub fn prev_field(&mut self) {
         if self.field_index == 0 {
-            self.field_index = self.fields.len() - 1;
+            self.field_index = self.fields.len();
         } else {
             self.field_index -= 1;
         }
@@ -357,73 +362,6 @@ impl CertForm {
             }
         }
     }
-
-    pub fn remove_alt_name(&mut self, index: usize) {
-        if index < self.alt_names.len() {
-            self.alt_names.remove(index);
-        }
-    }
-
-    fn sync_single_field(&mut self, field_index: usize) {
-        if field_index >= self.fields.len() {
-            return;
-        }
-
-        let field_value = &self.fields[field_index].value;
-
-        match field_index {
-            0 => self.country = field_value.clone(),
-            1 => self.state = field_value.clone(),
-            2 => self.organization = field_value.clone(),
-            3 => self.common_name = field_value.clone(),
-            4 => {
-                if let Ok(size) = field_value.parse::<u32>() {
-                    if size >= 1024 && size <= 8192 {
-                        self.key_size = size;
-                    }
-                }
-            }
-            5 => {
-                if let Ok(days) = field_value.parse::<u32>() {
-                    if days >= 1 && days <= 36500 {
-                        self.validity_days = days;
-                    }
-                }
-            }
-            6 => {
-                if let Ok(size) = field_value.parse::<u32>() {
-                    if size >= 2048 && size <= 8192 {
-                        self.ca_key_size = size;
-                    }
-                }
-            }
-            7 => {
-                if let Ok(days) = field_value.parse::<u32>() {
-                    if days >= 1 && days <= 36500 {
-                        self.ca_validity_days = days;
-                    }
-                }
-            }
-            8 => self.temp_alt_name = field_value.clone(),
-            _ => {}
-        }
-    }
-
-    // Keep the original sync_field_values for when you need to sync all fields
-    // But call it less frequently to avoid loops
-    fn sync_all_fields(&mut self) {
-        for i in 0..self.fields.len() {
-            self.sync_single_field(i);
-        }
-    }
-}
-
-#[derive(Clone, PartialEq)]
-pub enum SetupState {
-    Welcome,
-    DatabasePath,
-    RecentDatabases,
-    ConfigSettings,
 }
 
 impl App {
@@ -442,7 +380,6 @@ impl App {
             config,
             input_buffer: String::new(),
             input_mode: false,
-            setup_state: SetupState::Welcome,
             vertical_scroll: 0,
             show_generate_popup: false,
             cert_form: None,
@@ -453,9 +390,9 @@ impl App {
         }
     }
 
-    pub fn load_certificates(&mut self, path: &PathBuf) -> Result<(), CertMgtError> {
+    pub fn load_certificates(&mut self, path: &Path) -> Result<(), CertMgtError> {
         self.certificates = load_certificates_from_database(path)?;
-        self.database_path = Some(path.clone());
+        self.database_path = Some(path.to_path_buf());
 
         // Add to recent databases
         if let Some(path_str) = path.to_str() {
@@ -473,16 +410,15 @@ impl App {
     }
 
     pub fn try_auto_load(&mut self) {
-        if self.config.auto_load_default {
-            if let Some(default_path) = self.config.default_database_path.clone() {
-                let path = PathBuf::from(default_path.clone());
-                if path.exists() {
-                    if let Err(e) = &self.load_certificates(&path) {
-                        self.status_message =
-                            format!("Failed to auto-load {}: {}", default_path, e);
-                    }
-                    return;
+        if self.config.auto_load_default
+            && let Some(default_path) = self.config.default_database_path.clone()
+        {
+            let path = PathBuf::from(default_path.clone());
+            if path.exists() {
+                if let Err(e) = &self.load_certificates(&path) {
+                    self.status_message = format!("Failed to auto-load {}: {}", default_path, e);
                 }
+                return;
             }
         }
 
@@ -494,10 +430,10 @@ impl App {
         ];
 
         for path in default_paths {
-            if path.exists() {
-                if let Ok(()) = self.load_certificates(&path) {
-                    return;
-                }
+            if path.exists()
+                && let Ok(()) = self.load_certificates(&path)
+            {
+                return;
             }
         }
     }
@@ -510,14 +446,6 @@ impl App {
             }
         } else {
             self.status_message = format!("File does not exist: {}", path);
-        }
-    }
-
-    pub fn save_config(&mut self) {
-        if let Err(e) = self.config.save() {
-            self.status_message = format!("Failed to save config: {}", e);
-        } else {
-            self.status_message = "Configuration saved successfully".to_string();
         }
     }
 
@@ -558,7 +486,9 @@ impl App {
         self.list_state.select(Some(i));
     }
     fn next_ca(&mut self) {
-        if self.ca_list.is_empty() { return; }
+        if self.ca_list.is_empty() {
+            return;
+        }
         if self.ca_selected + 1 >= self.ca_list.len() {
             self.ca_selected = 0;
         } else {
@@ -567,7 +497,9 @@ impl App {
     }
 
     fn previous_ca(&mut self) {
-        if self.ca_list.is_empty() { return; }
+        if self.ca_list.is_empty() {
+            return;
+        }
         if self.ca_selected == 0 {
             self.ca_selected = self.ca_list.len() - 1;
         } else {
@@ -576,10 +508,10 @@ impl App {
     }
 
     pub fn enter_detail_view(&mut self) {
-        if let Some(selected) = self.list_state.selected() {
-            if selected < self.certificates.len() {
-                self.current_view = ViewMode::CertificateDetail(selected);
-            }
+        if let Some(selected) = self.list_state.selected()
+            && selected < self.certificates.len()
+        {
+            self.current_view = ViewMode::CertificateDetail(selected);
         }
     }
 
@@ -625,6 +557,30 @@ impl App {
             self.vertical_scroll = (self.vertical_scroll - 1) % 80;
         }
     }
+
+    /// Copy the visible certificate data of the detail view to the system clipboard
+    pub fn copy_cert_to_clipboard(&mut self, index: usize) {
+        let Some(cert) = self.certificates.get(index) else {
+            return;
+        };
+        let content = match &cert.cert_data {
+            certmgt_lib::CertData::Pem { cert, .. } => cert.clone(),
+            certmgt_lib::CertData::P12 { data, .. } => data.clone(),
+        };
+        let result: Result<(), arboard::Error> = (|| {
+            let mut clipboard = arboard::Clipboard::new()?;
+            clipboard.set_text(&content)?;
+            Ok(())
+        })();
+        self.status_message = match result {
+            Ok(()) => format!(
+                "{} copied to clipboard ({} bytes)",
+                cert.common_name,
+                content.len()
+            ),
+            Err(e) => format!("Clipboard copy failed: {e}"),
+        };
+    }
 }
 
 // Replace the launch_tui function in main.rs
@@ -665,26 +621,33 @@ pub fn launch_tui() -> anyhow::Result<()> {
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     loop {
-        terminal.draw(|f| ui::<B>(f, app))?;
+        terminal.draw(|f| ui(f, app))?;
 
         if let Event::Key(key) = event::read()? {
+            // Global quit: Ctrl+C works everywhere
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(());
+            }
+
             if app.show_ca_selector {
                 // Only handle CA selection keys
                 match key.code {
                     KeyCode::Up => app.previous_ca(),
                     KeyCode::Down => app.next_ca(),
                     KeyCode::Enter => {
-                        app.selected_ca = Some(app.ca_list[app.ca_selected].clone());
-                        app.show_ca_selector = false;
+                        if let Some(ca) = app.ca_list.get(app.ca_selected) {
+                            app.selected_ca = Some(ca.clone());
+                            app.show_ca_selector = false;
 
-                        if let Some(form) = app.cert_form.take() {
-                            handle_certificate_generation(app, form);
+                            if let Some(form) = app.cert_form.take() {
+                                handle_certificate_generation(app, form, terminal);
+                            }
                         }
                     }
                     KeyCode::Esc => app.show_ca_selector = false,
                     _ => {}
                 }
-                continue
+                continue;
             // Handle popup events first (highest priority)
             } else if app.show_generate_popup {
                 match key.code {
@@ -694,37 +657,53 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                         app.status_message = "Certificate generation cancelled".to_string();
                     }
                     KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if let Some(form) = app.cert_form.take() {
-                            // Debug version - add step-by-step status messages
-                            app.status_message = "Starting certificate generation...".to_string();
-
-                            handle_certificate_generation(app, form);
+                        let Some(form) = app.cert_form.take() else {
+                            continue;
+                        };
+                        if form.generate_new_ca {
+                            handle_certificate_generation(app, form, terminal);
+                            continue;
                         }
-                    }
-                    KeyCode::Char('c') => {
-                        if let Some(form) = app.cert_form.take() {
-                            if !form.generate_new_ca && app.selected_ca.is_none() {
-                                // Open CA selector instead of generating certificate yet
-                                let database = app.database_path.clone().unwrap();
-                                let all_certs = load_certificates_from_database(&database).unwrap_or_default();
-                                let available_cas: Vec<_> = all_certs.into_iter().filter(|c| c.is_ca).collect();
-
-                                if available_cas.is_empty() {
-                                    app.status_message = "No existing CA certificates found.".to_string();
-                                    app.cert_form = Some(form); // keep popup open
-                                } else if available_cas.len() == 1 {
-                                    app.selected_ca = Some(available_cas[0].clone());
-                                    handle_certificate_generation(app, form); // single CA, continue
-                                } else {
-                                    app.ca_list = available_cas;
-                                    app.ca_selected = 0;
-                                    app.show_ca_selector = true;
-                                    app.cert_form = Some(form); // keep form open but wait for CA
-                                }
-                            } else {
-                                // Either generating new CA or CA already selected
-                                handle_certificate_generation(app, form);
+                        let Some(database) = app.database_path.clone() else {
+                            app.status_message = "No database path available".to_string();
+                            app.cert_form = Some(form);
+                            continue;
+                        };
+                        let all_certs = match load_certificates_from_database(&database) {
+                            Ok(certs) => certs,
+                            Err(e) => {
+                                app.status_message = format!("Failed to load database: {e}");
+                                app.cert_form = Some(form);
+                                continue;
                             }
+                        };
+                        let available_cas: Vec<_> = all_certs
+                            .iter()
+                            .filter(|c| c.is_ca && c.has_private_key())
+                            .cloned()
+                            .collect();
+
+                        if available_cas.is_empty() {
+                            let has_ca_without_key =
+                                all_certs.iter().any(|c| c.is_ca && !c.has_private_key());
+                            app.status_message = if has_ca_without_key {
+                                "No CA with a private key found - tick 'Generate new CA' to create one"
+                                    .to_string()
+                            } else {
+                                "No existing CA certificates found - tick 'Generate new CA' to create one"
+                                    .to_string()
+                            };
+                            app.cert_form = Some(form); // keep popup open
+                        } else {
+                            // Always ask - even with a single CA, so the user confirms
+                            // which CA will sign before the (slow) keygen starts
+                            app.ca_list = available_cas;
+                            app.ca_selected = 0;
+                            app.show_ca_selector = true;
+                            app.cert_form = Some(form); // keep form open but wait for CA
+                            app.status_message =
+                                "Select a CA: Up/Down to navigate, Enter to confirm, Esc to cancel"
+                                    .to_string();
                         }
                     }
                     KeyCode::Tab => {
@@ -739,32 +718,64 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                     }
                     KeyCode::Enter => {
                         // Handle alt names on field 8
-                        if let Some(ref mut form) = app.cert_form {
-                            if form.field_index == 8 {
-                                let alt_name = form.temp_alt_name.trim().to_string();
-                                if !alt_name.is_empty() {
-                                    form.alt_names.push(alt_name);
-                                    form.temp_alt_name.clear();
-                                    if let Some(field) = form.fields.get_mut(8) {
-                                        field.value.clear();
-                                    }
-                                    app.status_message = "Alternative name added".to_string();
-                                }
-                            }
+                        if let Some(ref mut form) = app.cert_form
+                            && form.field_index == 8
+                            && !form.temp_alt_name.trim().is_empty()
+                        {
+                            form.add_alt_name();
+                            app.status_message = "Alternative name added".to_string();
                         }
+                    }
+                    KeyCode::Char(' ')
+                        if app
+                            .cert_form
+                            .as_ref()
+                            .is_some_and(|f| f.field_index == f.fields.len()) =>
+                    {
+                        if let Some(ref mut form) = app.cert_form {
+                            form.generate_new_ca = !form.generate_new_ca;
+                            app.status_message = if form.generate_new_ca {
+                                "New CA will be generated".to_string()
+                            } else {
+                                "An existing CA will be used".to_string()
+                            };
+                        }
+                    }
+                    KeyCode::F(2) => {
+                        let database = app
+                            .cert_form
+                            .as_ref()
+                            .map(|f| f.database.clone())
+                            .unwrap_or_default();
+                        // keep the database path the user typed in the form
+                        let form = CertForm {
+                            database,
+                            ..CertForm::default()
+                        };
+                        app.cert_form = Some(form);
+                        app.status_message = "Form reset".to_string();
                     }
                     KeyCode::Char(c) => {
-                        if let Some(ref mut form) = app.cert_form {
-                            if form.field_index < form.fields.len() {
-                                form.fields[form.field_index].value.push(c);
-                                // Update the corresponding struct field
-                                form.update_struct_field(form.field_index);
-                            }
+                        if let Some(ref mut form) = app.cert_form
+                            && form.field_index < form.fields.len()
+                        {
+                            form.fields[form.field_index].value.push(c);
+                            // Update the corresponding struct field
+                            form.update_struct_field(form.field_index);
                         }
                     }
-                    KeyCode::Backspace => {
-                        if let Some(ref mut form) = app.cert_form {
-                            if form.field_index < form.fields.len() {
+                    KeyCode::Backspace | KeyCode::Delete => {
+                        if let Some(ref mut form) = app.cert_form
+                            && form.field_index < form.fields.len()
+                        {
+                            // On the alt-names field with an empty buffer, remove the last alt name
+                            if form.field_index == 8
+                                && form.temp_alt_name.is_empty()
+                                && !form.alt_names.is_empty()
+                            {
+                                form.alt_names.pop();
+                                app.status_message = "Last alternative name removed".to_string();
+                            } else {
                                 form.fields[form.field_index].value.pop();
                                 form.update_struct_field(form.field_index);
                             }
@@ -814,11 +825,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                         app.previous();
                     }
                     KeyCode::Enter => {
-                        if let Some(selected) = app.list_state.selected() {
-                            if selected < app.config.recent_databases.len() {
-                                let path = app.config.recent_databases[selected].clone();
-                                app.set_database_path(path);
-                            }
+                        if let Some(selected) = app.list_state.selected()
+                            && selected < app.config.recent_databases.len()
+                        {
+                            let path = app.config.recent_databases[selected].clone();
+                            app.set_database_path(path);
                         }
                     }
                     _ => {}
@@ -835,10 +846,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                             app.status_message = "Enter path to certificate database:".to_string();
                         }
                         KeyCode::Char('r') => {
-                            if let Some(ref path) = app.database_path.clone() {
-                                if let Err(e) = app.load_certificates(path) {
-                                    app.status_message = format!("Error reloading: {}", e);
-                                }
+                            if let Some(ref path) = app.database_path.clone()
+                                && let Err(e) = app.load_certificates(path)
+                            {
+                                app.status_message = format!("Error reloading: {}", e);
                             }
                         }
                         KeyCode::Char('c') => app.show_config(),
@@ -858,10 +869,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                         _ => {}
                     }
                 }
-                ViewMode::CertificateDetail(_) => match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Esc | KeyCode::Backspace => app.back_to_list(),
+                ViewMode::CertificateDetail(index) => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace => app.back_to_list(),
                     KeyCode::Char('h') => app.toggle_help(),
+                    KeyCode::Char('c') => app.copy_cert_to_clipboard(index),
                     KeyCode::Down => app.scroll_down(),
                     KeyCode::Up => app.scroll_up(),
                     _ => {}
@@ -869,14 +880,13 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                 ViewMode::Config => match key.code {
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Esc => app.back_to_list(),
-                    KeyCode::Char('s') => app.save_config(),
                     _ => {}
                 },
                 ViewMode::Help => {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('h') => {
                             // Go back to previous view
-                            app.current_view = ViewMode::CertificateList;
+                            app.toggle_help();
                         }
                         _ => {}
                     }
@@ -886,34 +896,34 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
     }
 }
 
-fn ui<B: Backend>(f: &mut Frame, app: &mut App) {
+fn ui(f: &mut Frame, app: &mut App) {
     match app.current_view {
-        ViewMode::Setup => draw_setup_screen::<B>(f, app),
+        ViewMode::Setup => draw_setup_screen(f, app),
         ViewMode::CertificateList => {
-            draw_certificate_list::<B>(f, app);
+            draw_certificate_list(f, app);
 
             // Draw popup on top if needed
-            if app.show_generate_popup {
-                if let Some(ref form) = app.cert_form {
-                    draw_cert_popup::<B>(f, form);
-                }
+            if app.show_generate_popup
+                && let Some(ref form) = app.cert_form
+            {
+                draw_cert_popup(f, form);
             }
             // Draw popup for ca cert list
             if app.show_ca_selector {
-                draw_ca_selection_popup::<B>(f, f.size(), &app.ca_list, &mut {
+                draw_ca_selection_popup(f, f.area(), &app.ca_list, &app.certificates, &mut {
                     let mut state = ListState::default();
                     state.select(Some(app.ca_selected));
                     state
                 });
             }
         }
-        ViewMode::CertificateDetail(index) => draw_certificate_detail::<B>(f, app, index),
-        ViewMode::Help => draw_help::<B>(f, app),
-        ViewMode::Config => draw_config_screen::<B>(f, app),
+        ViewMode::CertificateDetail(index) => draw_certificate_detail(f, app, index),
+        ViewMode::Help => draw_help(f, app),
+        ViewMode::Config => draw_config_screen(f, app),
     }
 }
 
-fn draw_setup_screen<B: Backend>(f: &mut Frame, app: &mut App) {
+fn draw_setup_screen(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
@@ -923,7 +933,7 @@ fn draw_setup_screen<B: Backend>(f: &mut Frame, app: &mut App) {
             Constraint::Length(4), // Input area
             Constraint::Length(3), // Status/help
         ])
-        .split(f.size());
+        .split(f.area());
 
     // Welcome banner
     let banner = vec![
@@ -947,8 +957,7 @@ fn draw_setup_screen<B: Backend>(f: &mut Frame, app: &mut App) {
             .config
             .recent_databases
             .iter()
-            .enumerate()
-            .map(|(i, path)| {
+            .map(|path| {
                 let exists = Path::new(path).exists();
                 let status_icon = if exists { "✅" } else { "❌" };
                 let style = if exists {
@@ -1016,7 +1025,7 @@ fn draw_setup_screen<B: Backend>(f: &mut Frame, app: &mut App) {
     f.render_widget(status, chunks[3]);
 }
 
-fn draw_config_screen<B: Backend>(f: &mut Frame, app: &App) {
+fn draw_config_screen(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -1025,7 +1034,7 @@ fn draw_config_screen<B: Backend>(f: &mut Frame, app: &App) {
             Constraint::Min(0),
             Constraint::Length(3),
         ])
-        .split(f.size());
+        .split(f.area());
 
     // Title
     let title = Paragraph::new("Configuration Settings")
@@ -1084,14 +1093,16 @@ fn draw_config_screen<B: Backend>(f: &mut Frame, app: &App) {
     f.render_widget(config_paragraph, chunks[1]);
 
     // Actions
-    let actions = Paragraph::new("Press 's' to save configuration, ESC to go back, 'q' to quit")
+    let actions = Paragraph::new(
+        "Configuration is read-only here - edit the config file directly. ESC to go back, 'q' to quit",
+    )
         .style(Style::default().fg(Color::Yellow))
         .block(Block::default().borders(Borders::ALL).title("Actions"));
     f.render_widget(actions, chunks[2]);
 }
 
 // Keep existing certificate list, detail, and help functions...
-fn draw_certificate_list<B: Backend>(f: &mut Frame, app: &mut App) {
+fn draw_certificate_list(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -1100,7 +1111,7 @@ fn draw_certificate_list<B: Backend>(f: &mut Frame, app: &mut App) {
             Constraint::Min(0),
             Constraint::Length(3),
         ])
-        .split(f.size());
+        .split(f.area());
 
     // Title with database info
     let title_text = if let Some(ref path) = app.database_path {
@@ -1124,7 +1135,8 @@ fn draw_certificate_list<B: Backend>(f: &mut Frame, app: &mut App) {
         .iter()
         .enumerate()
         .map(|(i, cert)| {
-            let expires_in_days = (cert.not_after - chrono::Utc::now().timestamp()) / 86400;
+            let expires_in_days =
+                (cert.not_after.timestamp() - chrono::Utc::now().timestamp()) / 86400;
             let status_color = if expires_in_days < 0 {
                 Color::Red
             } else if expires_in_days < app.config.expiry_warning_days as i64 {
@@ -1144,6 +1156,19 @@ fn draw_certificate_list<B: Backend>(f: &mut Frame, app: &mut App) {
                 certmgt_lib::CertData::P12 { .. } => "P12",
             };
 
+            let issuer_cn = cert
+                .ca_id
+                .as_deref()
+                .and_then(|id| app.certificates.iter().find(|c| c.id == id))
+                .map(|c| c.common_name.clone())
+                .unwrap_or_else(|| {
+                    if cert.is_ca {
+                        "-".to_string()
+                    } else {
+                        cert.issuer_dn.chars().take(24).collect()
+                    }
+                });
+
             let line = Line::from(vec![
                 Span::styled(format!("{:3} ", i + 1), Style::default().fg(Color::Gray)),
                 Span::styled(
@@ -1155,7 +1180,7 @@ fn draw_certificate_list<B: Backend>(f: &mut Frame, app: &mut App) {
                 ),
                 Span::styled(
                     format!(
-                        "{:<40} ",
+                        "{:<31} ",
                         cert.serial_number.chars().take(30).collect::<String>()
                     ),
                     Style::default().fg(Color::White),
@@ -1174,6 +1199,14 @@ fn draw_certificate_list<B: Backend>(f: &mut Frame, app: &mut App) {
                         Color::Magenta
                     } else {
                         Color::Cyan
+                    }),
+                ),
+                Span::styled(
+                    issuer_cn,
+                    Style::default().fg(if cert.ca_id.is_some() {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
                     }),
                 ),
             ]);
@@ -1207,7 +1240,7 @@ fn draw_certificate_list<B: Backend>(f: &mut Frame, app: &mut App) {
     f.render_widget(status, chunks[2]);
 }
 
-fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
+fn draw_certificate_detail(f: &mut Frame, app: &App, index: usize) {
     if index >= app.certificates.len() {
         return;
     }
@@ -1219,9 +1252,10 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(0),
+            Constraint::Length(1),
             Constraint::Length(3),
         ])
-        .split(f.size());
+        .split(f.area());
 
     // Title
     let title = Paragraph::new(format!("Certificate Details - {}", cert.common_name))
@@ -1234,13 +1268,9 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
     f.render_widget(title, chunks[0]);
 
     // Certificate details
-    let expires_in_days = (cert.not_after - chrono::Utc::now().timestamp()) / 86400;
-    let not_before = chrono::DateTime::from_timestamp(cert.not_before, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| "Invalid date".to_string());
-    let not_after = chrono::DateTime::from_timestamp(cert.not_after, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| "Invalid date".to_string());
+    let expires_in_days = (cert.not_after.timestamp() - chrono::Utc::now().timestamp()) / 86400;
+    let not_before = cert.not_before.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let not_after = cert.not_after.format("%Y-%m-%d %H:%M:%S UTC").to_string();
 
     let status = if expires_in_days < 0 {
         format!("❌ EXPIRED ({} days ago)", -expires_in_days)
@@ -1267,8 +1297,21 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
             }
         }
     };
+    let issuer = cert
+        .ca_id
+        .as_deref()
+        .and_then(|id| app.certificates.iter().find(|c| c.id == id))
+        .map(|c| c.common_name.clone())
+        .unwrap_or_else(|| {
+            if cert.is_ca {
+                "(self-signed)".to_string()
+            } else {
+                cert.issuer_dn.clone()
+            }
+        });
     let detail_text = format!(
-        "Common Name: {}\n\
+        "ID: {}\n\
+         Common Name: {}\n\
          Organization: {}\n\
          Organizational Unit: {}\n\
          Country: {}\n\
@@ -1277,13 +1320,15 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
          \n\
          Certificate Type: {}\n\
          Is CA: {}\n\
+         Issuer: {}\n\
          Key Size: {:?}\n\
          Has Private Key: {}\n\
          Valid From: {}\n\
          Valid Until: {}\n\
          Status: {}\n\
-         Cert Data: {}\n
+         Cert Data: {}\n\
          Key Data: {}\n",
+        cert.id,
         cert.common_name,
         cert.organization,
         cert.organizational_unit,
@@ -1292,13 +1337,14 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
         cert.locality,
         cert_info.0,
         cert.is_ca,
+        issuer,
         cert.key_size,
         cert.has_private_key(),
         not_before,
         not_after,
         status,
         cert_info.1,
-        cert_info.2.unwrap_or_else(|| "")
+        cert_info.2.unwrap_or("")
     );
 
     let detail_paragraph = Paragraph::new(detail_text)
@@ -1308,14 +1354,21 @@ fn draw_certificate_detail<B: Backend>(f: &mut Frame, app: &App, index: usize) {
         .wrap(Wrap { trim: true });
     f.render_widget(detail_paragraph, chunks[1]);
 
+    // Status (copy feedback etc.)
+    let status_bar = Paragraph::new(format!(" {} ", app.status_message))
+        .style(Style::default().fg(Color::Green));
+    f.render_widget(status_bar, chunks[2]);
+
     // Navigation help
-    let help = Paragraph::new("Press ESC or Backspace to go back, 'h' for help, 'q' to quit")
-        .style(Style::default().fg(Color::Yellow))
-        .block(Block::default().borders(Borders::ALL).title("Navigation"));
-    f.render_widget(help, chunks[2]);
+    let help = Paragraph::new(
+        "Press ESC or Backspace to go back, 'h' for help, 'c' to copy cert, 'q' to quit",
+    )
+    .style(Style::default().fg(Color::Yellow))
+    .block(Block::default().borders(Borders::ALL).title("Navigation"));
+    f.render_widget(help, chunks[3]);
 }
 
-fn draw_help<B: Backend>(f: &mut Frame, app: &App) {
+fn draw_help(f: &mut Frame, _app: &App) {
     let help_text = "Certificate Management TUI - Help\n\n\
         SETUP SCREEN:\n\
         n           Enter new database path\n\
@@ -1365,7 +1418,7 @@ fn draw_help<B: Backend>(f: &mut Frame, app: &App) {
         )
         .wrap(Wrap { trim: true });
 
-    let area = centered_rect(80, 80, f.size());
+    let area = centered_rect(80, 80, f.area());
     f.render_widget(Clear, area);
     f.render_widget(help_paragraph, area);
 }
@@ -1390,7 +1443,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
+fn handle_certificate_generation<B: Backend>(
+    app: &mut App,
+    mut form: CertForm,
+    terminal: &mut Terminal<B>,
+) {
     // Step 1: Validation
     app.status_message = "Validating form...".to_string();
     if !form.validate() {
@@ -1412,9 +1469,21 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
     };
     let database = PathBuf::from(database_path);
 
+    // Step 3: Selected CA must actually be able to sign
+    if !form.generate_new_ca
+        && let Some(ref ca_cert) = app.selected_ca
+        && !ca_cert.has_private_key()
+    {
+        app.status_message = format!(
+            "CA '{}' has no private key - tick 'Generate new CA' to create one",
+            ca_cert.common_name
+        );
+        app.selected_ca = None;
+        app.cert_form = Some(form);
+        return;
+    }
 
-
-    // Step 3: Create CA config
+    // Step 4: Create CA config
     app.status_message = "Creating CA configuration...".to_string();
     let ca_config = CaConfig {
         country: form.country.clone(),
@@ -1427,6 +1496,10 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
 
     let ca_cert = match form.generate_new_ca {
         true => {
+            app.status_message =
+                "Generating CA certificate (RSA keygen, may take a moment)...".to_string();
+            // Redraw so the status is visible before the blocking keygen
+            let _ = terminal.draw(|f| ui(f, app));
             match CertificateConfig::new_ca(ca_config) {
                 Ok(cert) => {
                     app.status_message = "CA certificate created successfully".to_string();
@@ -1439,13 +1512,16 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
                 }
             }
         }
-        false => {
-            app.selected_ca.clone().unwrap()
-        }
+        false => match app.selected_ca.clone() {
+            Some(ca) => ca,
+            None => {
+                app.status_message =
+                    "No CA selected - select an existing CA or generate a new CA".to_string();
+                app.cert_form = Some(form);
+                return;
+            }
+        },
     };
-
-    // Step 4: Generate CA (this might be where it freezes)
-    app.status_message = "Generating CA certificate...".to_string();
 
     // Step 5: Create server config
     app.status_message = "Creating server certificate configuration...".to_string();
@@ -1459,8 +1535,11 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
         validity_days: form.validity_days,
     };
 
-    // Step 6: Generate server cert (another potential freeze point)
-    app.status_message = "Generating server certificate...".to_string();
+    // Step 6: Generate server cert
+    app.status_message =
+        "Generating server certificate (RSA keygen, may take a moment)...".to_string();
+    // Redraw so the status is visible before the blocking keygen
+    let _ = terminal.draw(|f| ui(f, app));
     let server_cert = match CertificateConfig::sign_certificate(&ca_cert, &server_config) {
         Ok(cert) => {
             app.status_message = "Server certificate created successfully".to_string();
@@ -1476,17 +1555,9 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
     // Step 7: Save generated certificates using import()
     let new_certs = vec![ca_cert, server_cert];
 
-    if let Err(e) = import(
-        &app.config,
-        new_certs,
-        database,
-        false,
-        true,
-        None,
-        false,
-    ) {
+    if let Err(e) = import(&app.config, new_certs, database, false, true, None, false) {
         app.status_message = format!("Save failed: {}", e);
-        app.cert_form = Some(form);  // preserve form
+        app.cert_form = Some(form); // preserve form
         return;
     }
 
@@ -1495,60 +1566,15 @@ fn handle_certificate_generation(app: &mut App, mut form: CertForm) {
     app.cert_form = None;
 
     // Reload certificates in TUI
-    if let Some(ref path) = app.database_path.clone() {
-        if let Err(e) = app.load_certificates(path) {
-            app.status_message = format!("Saved but reload failed: {}", e);
-        }
-    }
-
-}
-
-// This is your selectable CA popup
-pub fn tui_select_ca<B: Backend>(
-    ca_list: &[CertificateConfig],
-    f: &mut Frame,
-    app: &mut App,
-) -> Option<CertificateConfig> {
-    if ca_list.is_empty() {
-        return None;
-    }
-
-    let mut state = ListState::default();
-    state.select(Some(0)); // default selection at the top
-
-    loop {
-        let area = f.size();
-        draw_ca_selection_popup::<B>(f, area, ca_list, &mut state);
-
-        // Wait for key event
-        if let Event::Key(key) = event::read().unwrap() {
-            match key.code {
-                KeyCode::Up => {
-                    let i = state.selected().unwrap_or(0);
-                    if i > 0 {
-                        state.select(Some(i - 1));
-                    }
-                }
-                KeyCode::Down => {
-                    let i = state.selected().unwrap_or(0);
-                    if i < ca_list.len() - 1 {
-                        state.select(Some(i + 1));
-                    }
-                }
-                KeyCode::Enter => {
-                    if let Some(i) = state.selected() {
-                        return Some(ca_list[i].clone());
-                    }
-                }
-                KeyCode::Esc => return None,
-                _ => {}
-            }
-        }
+    if let Some(ref path) = app.database_path.clone()
+        && let Err(e) = app.load_certificates(path)
+    {
+        app.status_message = format!("Saved but reload failed: {}", e);
     }
 }
 
-fn draw_cert_popup<B: Backend>(f: &mut Frame, form: &CertForm) {
-    let area = f.size();
+fn draw_cert_popup(f: &mut Frame, form: &CertForm) {
+    let area = f.area();
 
     // Create a reasonably sized popup (don't make it too big)
     let popup_width = std::cmp::min(80, area.width.saturating_sub(4));
@@ -1590,31 +1616,36 @@ fn draw_cert_popup<B: Backend>(f: &mut Frame, form: &CertForm) {
         ])
         .split(inner);
 
-        let checkbox_text = if form.generate_new_ca {
-            "[ ] Generate new CA"
+    let checkbox_active = form.field_index == form.fields.len();
+    let checkbox_text = if form.generate_new_ca {
+        "[X] Generate new CA"
+    } else {
+        "[ ] Generate new CA"
+    };
+
+    let checkbox = Paragraph::new(checkbox_text)
+        .style(if checkbox_active {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
         } else {
-            "[X] Generate new CA"
-        };
+            Style::default().fg(Color::Yellow)
+        })
+        .alignment(Alignment::Left);
 
-        let checkbox = Paragraph::new(checkbox_text)
-            .style(Style::default().fg(Color::Yellow))
-            .alignment(Alignment::Left);
-
-        f.render_widget(checkbox, chunks[2]);
+    f.render_widget(checkbox, chunks[2]);
 
     // Controls go one row lower now
-    draw_action_buttons::<B>(f, chunks[3], form);
+    draw_action_buttons(f, chunks[3], form);
     // Draw each section
-    draw_form_fields_simple::<B>(f, chunks[0], form);
-    // draw_action_buttons::<B>(f, chunks[2], form);
+    draw_form_fields_simple(f, chunks[0], form);
+    // draw_action_buttons(f, chunks[2], form);
 }
 
-
-fn draw_ca_selection_popup<B: Backend>(
+fn draw_ca_selection_popup(
     f: &mut Frame,
     area: Rect,
     ca_list: &[CertificateConfig],
-    state: &mut ListState
+    certificates: &[CertificateConfig],
+    state: &mut ListState,
 ) {
     let popup_width = std::cmp::min(60, area.width.saturating_sub(4));
     let popup_height = std::cmp::min(20, area.height.saturating_sub(2));
@@ -1636,29 +1667,41 @@ fn draw_ca_selection_popup<B: Backend>(
 
     f.render_widget(popup_block.clone(), popup_area);
 
-    let inner = popup_area.inner(Margin { vertical: 1, horizontal: 1 });
+    let inner = popup_area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
 
     // Turn CAs into list items
-    let items: Vec<ListItem> = ca_list.iter()
+    let items: Vec<ListItem> = ca_list
+        .iter()
         .map(|ca| {
-            let expiration = (ca.not_after - chrono::Utc::now().timestamp()) / 86400;
+            let expiration = (ca.not_after.timestamp() - chrono::Utc::now().timestamp()) / 86400;
+            let linked = certificates
+                .iter()
+                .filter(|c| !c.is_ca && c.ca_id.as_deref() == Some(&ca.id))
+                .count();
             let label = format!(
-                "{} ({} days, key {:?})",
-                ca.common_name, expiration, ca.key_size
+                "{} ({} days, key {:?}, {} certs)",
+                ca.common_name, expiration, ca.key_size, linked
             );
             ListItem::new(label)
         })
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().title("Available CA Certificates").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Available CA Certificates")
+                .borders(Borders::ALL),
+        )
         .highlight_style(Style::default().fg(Color::Yellow).bg(Color::Blue))
         .highlight_symbol(">> ");
 
     f.render_stateful_widget(list, inner, state);
 }
 
-fn draw_form_fields_simple<B: Backend>(f: &mut Frame, area: Rect, form: &CertForm) {
+fn draw_form_fields_simple(f: &mut Frame, area: Rect, form: &CertForm) {
     let mut lines = Vec::new();
 
     // Show ALL fields including alt names (index 8)
@@ -1707,7 +1750,8 @@ fn draw_form_fields_simple<B: Backend>(f: &mut Frame, area: Rect, form: &CertFor
 
     f.render_widget(paragraph, area);
 }
-fn draw_alt_names_section<B: Backend>(f: &mut Frame, area: Rect, form: &CertForm) {
+#[allow(dead_code)]
+fn draw_alt_names_section(f: &mut Frame, area: Rect, form: &CertForm) {
     let block = Block::default()
         .title("Alternative Names")
         .borders(Borders::ALL)
@@ -1737,7 +1781,7 @@ fn draw_alt_names_section<B: Backend>(f: &mut Frame, area: Rect, form: &CertForm
     }
 }
 
-fn draw_action_buttons<B: Backend>(f: &mut Frame, area: Rect, _form: &CertForm) {
+fn draw_action_buttons(f: &mut Frame, area: Rect, _form: &CertForm) {
     let help_text = vec![
         Line::from(vec![
             Span::styled("Tab/Shift+Tab", Style::default().fg(Color::Yellow)),
@@ -1750,6 +1794,8 @@ fn draw_action_buttons<B: Backend>(f: &mut Frame, area: Rect, _form: &CertForm) 
         Line::from(vec![
             Span::styled("Delete", Style::default().fg(Color::Red)),
             Span::raw(": Remove Alt Name • "),
+            Span::styled("Space", Style::default().fg(Color::Cyan)),
+            Span::raw(": Toggle New CA • "),
             Span::styled("F2", Style::default().fg(Color::Blue)),
             Span::raw(": Reset Form • "),
             Span::styled("Esc", Style::default().fg(Color::Red)),

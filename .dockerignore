@@ -1,0 +1,12 @@
+.git
+.gitlab-ci.yml
+target/
+artifacts/
+cargo-chef/
+*.pem
+*.p12
+*.b64
+*.parquet
+*.json
+/p12
+test/
